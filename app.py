@@ -322,7 +322,7 @@ def render_download_options(key_prefix: str,
         st.markdown("**🎞️ Vídeo & áudio**")
         mode = st.radio(
             "Modo",
-            ["Vídeo + áudio", "Apenas vídeo", "Apenas áudio"],
+            ["Vídeo + áudio", "Apenas vídeo", "Apenas áudio", "Apenas legendas"],
             horizontal=True,
             key=f"{key_prefix}_mode",
         )
@@ -331,7 +331,7 @@ def render_download_options(key_prefix: str,
             [lbl for lbl, _ in QUALIDADES],
             index=0,
             key=f"{key_prefix}_quality",
-            disabled=(mode == "Apenas áudio"),
+            disabled=(mode in ("Apenas áudio", "Apenas legendas")),
         )
         quality_h = dict(QUALIDADES)[quality_label]
 
@@ -339,7 +339,7 @@ def render_download_options(key_prefix: str,
             "Container",
             CONTAINERS, index=0,
             key=f"{key_prefix}_container",
-            disabled=(mode == "Apenas áudio"),
+            disabled=(mode in ("Apenas áudio", "Apenas legendas")),
         )
         audio_fmt = st.selectbox(
             "Formato de áudio (p/ modo 'Apenas áudio')",
@@ -384,19 +384,24 @@ def render_download_options(key_prefix: str,
             value=True,
             key=f"{key_prefix}_kf",
             help="Mais lento, mas o vídeo não fica cortado no meio de um frame.",
-            disabled=not trim_enabled,
+            disabled=(not trim_enabled or mode == "Apenas legendas"),
         )
         embed_thumb = st.checkbox(
             "Embutir thumbnail no arquivo", value=False,
             key=f"{key_prefix}_thumb",
+            disabled=(mode == "Apenas legendas"),
         )
+        if mode == "Apenas legendas":
+            st.session_state[f"{key_prefix}_subs"] = True
         subtitles = st.checkbox(
             "Baixar legendas (pt/pt-BR/en)", value=False,
             key=f"{key_prefix}_subs",
+            disabled=(mode == "Apenas legendas"),
         )
 
     # Monta dict de kwargs para build_options
     audio_only = (mode == "Apenas áudio")
+    subtitles_only = (mode == "Apenas legendas")
     if mode == "Apenas vídeo":
         # format só de vídeo (sem áudio)
         if quality_h:
@@ -415,7 +420,8 @@ def render_download_options(key_prefix: str,
         "trim_end": trim_end,
         "force_keyframes_at_cuts": keyframes,
         "embed_thumbnail": embed_thumb,
-        "write_subtitles": subtitles,
+        "write_subtitles": subtitles or subtitles_only,
+        "subtitles_only": subtitles_only,
     }
 
 

@@ -145,6 +145,114 @@ def format_bytes(n: float | int | None) -> str:
 
 
 # ================================================================
+# Utilitários de legendas (trimming)
+# ================================================================
+
+_SUB_TS_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})")
+
+# Captura blocos VTT (sem número de sequência) e SRT (com número).
+# Grupo 1: timestamp início, grupo 2: timestamp fim, grupo 3: texto.
+_CUE_RE = re.compile(
+    r"(?:^\d+\s*\n)?"  # número de sequência opcional (SRT)
+    r"(\d{1,2}:\d{2}:\d{2}[,.]\d{3})"  # timestamp início
+    r"\s*-->\s*"
+    r"(\d{1,2}:\d{2}:\d{2}[,.]\d{3})"  # timestamp fim
+    r"[^\n]*\n"                          # resto da linha (align:start etc.)
+    r"((?:(?!\n\n|\n\r\n).+(?:\n|$))+)",  # texto (até bloco vazio)
+    re.MULTILINE,
+)
+
+# Tags inline do VTT: <00:00:03.439>, <c>, </c>, etc.
+_VTT_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _parse_sub_time(s: str) -> float:
+    """'00:01:30,500' ou '00:01:30.500' → 90.5"""
+    m = _SUB_TS_RE.match(s.strip())
+    if not m:
+        return 0.0
+    h, mn, sec, ms = m.groups()
+    return int(h) * 3600 + int(mn) * 60 + int(sec) + int(ms) / 1000
+
+
+def _format_srt_time(seconds: float) -> str:
+    """90.5 → '00:01:30,500'"""
+    if seconds < 0:
+        seconds = 0.0
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds % 1) * 1000)) % 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _clean_vtt_text(text: str) -> str:
+    """Remove tags inline do VTT e linhas em branco extras."""
+    text = _VTT_TAG_RE.sub("", text)
+    # Colapsa linhas duplicadas consecutivas (YouTube repete texto)
+    lines: list[str] = []
+    for line in text.strip().splitlines():
+        stripped = line.strip()
+        if stripped and (not lines or stripped != lines[-1]):
+            lines.append(stripped)
+    return "\n".join(lines)
+
+
+def _trim_subtitle_file(
+    filepath: Path,
+    trim_start: float,
+    trim_end: float | None,
+) -> None:
+    """Filtra e re-sincroniza um arquivo .srt/.vtt para o intervalo de corte."""
+    try:
+        content = filepath.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+
+    is_vtt = filepath.suffix.lower() == ".vtt"
+    sep = "." if is_vtt else ","
+
+    cues = _CUE_RE.findall(content)
+    new_blocks: list[str] = []
+    idx = 1
+
+    for start_ts, end_ts, text in cues:
+        start = _parse_sub_time(start_ts)
+        end = _parse_sub_time(end_ts)
+
+        if end <= trim_start:
+            continue
+        if trim_end is not None and start >= trim_end:
+            continue
+
+        # Pula cues fantasma do YouTube (duração ~0.01s, texto em branco)
+        clean = _clean_vtt_text(text)
+        if not clean:
+            continue
+
+        new_start = max(0.0, start - trim_start)
+        new_end = end - trim_start
+        if trim_end is not None:
+            new_end = min(new_end, trim_end - trim_start)
+
+        ts_s = _format_srt_time(new_start).replace(",", sep)
+        ts_e = _format_srt_time(new_end).replace(",", sep)
+
+        if is_vtt:
+            new_blocks.append(f"{ts_s} --> {ts_e}\n{clean}\n")
+        else:
+            new_blocks.append(f"{idx}\n{ts_s} --> {ts_e}\n{clean}\n")
+        idx += 1
+
+    if is_vtt:
+        header = "WEBVTT\n\n"
+    else:
+        header = ""
+    result = header + "\n".join(new_blocks) + "\n" if new_blocks else header
+    filepath.write_text(result, encoding="utf-8")
+
+
+# ================================================================
 # Helpers de format spec (yt-dlp)
 # ================================================================
 
@@ -220,6 +328,7 @@ def build_options(
     trim_end: Optional[float] = None,
     force_keyframes_at_cuts: bool = True,
     write_subtitles: bool = False,
+    subtitles_only: bool = False,
     subtitles_langs: Optional[list[str]] = None,
     embed_thumbnail: bool = False,
     embed_metadata: bool = True,
@@ -246,7 +355,9 @@ def build_options(
 
     # Format
     postprocessors: list[dict] = []
-    if audio_only:
+    if subtitles_only:
+        opts["skip_download"] = True
+    elif audio_only:
         opts["format"] = "bestaudio/best"
         postprocessors.append({
             "key": "FFmpegExtractAudio",
@@ -257,25 +368,35 @@ def build_options(
         opts["format"] = format_spec
         opts["merge_output_format"] = merge_format
 
-    # Metadata / thumbnail
-    if embed_metadata:
-        postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
-    if embed_thumbnail:
-        opts["writethumbnail"] = True
-        postprocessors.append({
-            "key": "EmbedThumbnail",
-            "already_have_thumbnail": False,
-        })
+    # Metadata / thumbnail (apenas quando baixa mídia)
+    if not subtitles_only:
+        if embed_metadata:
+            postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
+        if embed_thumbnail:
+            opts["writethumbnail"] = True
+            postprocessors.append({
+                "key": "EmbedThumbnail",
+                "already_have_thumbnail": False,
+            })
 
-    # Legendas
-    if write_subtitles:
+    # Legendas — configuração base (langs, etc.)
+    _subs_langs = subtitles_langs or ["pt", "pt-BR", "en"]
+
+    # Quando há trim + legendas juntos, yt-dlp pode corromper o vídeo.
+    # Solução: separar em dois passes — vídeo trimado sem legendas,
+    # depois legendas baixadas à parte e trimadas por nós.
+    has_trim = trim_start is not None or trim_end is not None
+    _need_separate_subs = (write_subtitles and has_trim and not subtitles_only)
+
+    if (write_subtitles or subtitles_only) and not _need_separate_subs:
         opts["writesubtitles"] = True
         opts["writeautomaticsub"] = True
-        opts["subtitleslangs"] = subtitles_langs or ["pt", "pt-BR", "en"]
+        opts["subtitleslangs"] = _subs_langs
         opts["subtitlesformat"] = "best"
-
-    if postprocessors:
-        opts["postprocessors"] = postprocessors
+        postprocessors.append({
+            "key": "FFmpegSubtitlesConvertor",
+            "format": "srt",
+        })
 
     # Cookies
     if cookies_file and Path(cookies_file).exists():
@@ -288,13 +409,29 @@ def build_options(
         opts["playlist_items"] = playlist_items
 
     # Cortes (trim)
-    if trim_start is not None or trim_end is not None:
+    if has_trim:
         start = float(trim_start) if trim_start is not None else 0.0
         end = float(trim_end) if trim_end is not None else None
-        # end=None → yt-dlp interpreta como até o fim
-        ranges = [(start, end if end is not None else float("inf"))]
-        opts["download_ranges"] = download_range_func(None, ranges)
-        opts["force_keyframes_at_cuts"] = force_keyframes_at_cuts
+        if not subtitles_only:
+            # end=None → yt-dlp interpreta como até o fim
+            ranges = [(start, end if end is not None else float("inf"))]
+            opts["download_ranges"] = download_range_func(None, ranges)
+            opts["force_keyframes_at_cuts"] = force_keyframes_at_cuts
+        # Marca legendas para trimming pós-download
+        if write_subtitles or subtitles_only:
+            opts["_subtitle_trim"] = {
+                "trim_start": start,
+                "trim_end": end,
+            }
+
+    # Sinaliza que legendas precisam ser baixadas separadamente
+    if _need_separate_subs:
+        opts["_separate_subs"] = {
+            "langs": _subs_langs,
+        }
+
+    if postprocessors:
+        opts["postprocessors"] = postprocessors
 
     # Hooks
     if progress_hook:
@@ -355,5 +492,54 @@ def download(urls: Iterable[str], opts: dict) -> int:
     urls = list(urls)
     if not urls:
         raise ValueError("Nenhuma URL informada.")
+
+    opts = dict(opts)  # não muta o dict do chamador
+    subtitle_trim = opts.pop("_subtitle_trim", None)
+    separate_subs = opts.pop("_separate_subs", None)
+
+    # Rastreia legendas existentes para trimming posterior
+    outtmpl = opts.get("outtmpl", "%(title)s.%(ext)s")
+    output_dir = Path(outtmpl).parent
+    pre_subs: set[Path] = set()
+    if subtitle_trim and output_dir.exists():
+        pre_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
+
+    # ---- Passo 1: download principal (vídeo/áudio, SEM legendas se trim ativo) ----
     with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.download(urls)
+        rc = ydl.download(urls)
+
+    # ---- Passo 2: legendas separadas (quando trim + legendas juntos) ----
+    if separate_subs is not None:
+        subs_opts = {**BASE_OPTS, "quiet": opts.get("quiet", True)}
+        subs_opts["skip_download"] = True
+        subs_opts["writesubtitles"] = True
+        subs_opts["writeautomaticsub"] = True
+        subs_opts["subtitleslangs"] = separate_subs["langs"]
+        subs_opts["subtitlesformat"] = "best"
+        subs_opts["outtmpl"] = outtmpl
+        subs_opts["noplaylist"] = opts.get("noplaylist", True)
+        subs_opts["postprocessors"] = [{
+            "key": "FFmpegSubtitlesConvertor",
+            "format": "srt",
+        }]
+        # Cookies (copiar do opts original)
+        for ck in ("cookiefile", "cookiesfrombrowser"):
+            if ck in opts:
+                subs_opts[ck] = opts[ck]
+        if "playlist_items" in opts:
+            subs_opts["playlist_items"] = opts["playlist_items"]
+
+        with yt_dlp.YoutubeDL(subs_opts) as ydl:
+            ydl.download(urls)  # ignora retcode das legendas
+
+    # ---- Passo 3: recorta legendas criadas neste download ----
+    if subtitle_trim and output_dir.exists():
+        post_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
+        for sub_file in (post_subs - pre_subs):
+            _trim_subtitle_file(
+                sub_file,
+                subtitle_trim["trim_start"],
+                subtitle_trim["trim_end"],
+            )
+
+    return rc
