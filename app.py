@@ -79,16 +79,20 @@ QUALIDADES = [
     ("360p",       360),
 ]
 
+# Mapa altura → label bonito
+_RES_LABELS = {2160: "4K (2160p)", 1440: "1440p", 1080: "1080p",
+               720: "720p", 480: "480p", 360: "360p", 240: "240p", 144: "144p"}
+
 FORMATOS_AUDIO = ["mp3", "m4a", "opus", "wav", "flac", "aac"]
 CONTAINERS     = ["mp4", "mkv", "webm"]
 NAVEGADORES    = ["firefox", "chrome", "edge", "brave", "opera",
                   "vivaldi", "safari", "chromium"]
 
 AUDIO_QUALITIES = [
-    ("Melhor (VBR 0)", "0"),
-    ("Alta (VBR 2 ≈ 190 kbps)", "2"),
-    ("Média (VBR 5 ≈ 130 kbps)", "5"),
-    ("Baixa (VBR 7 ≈ 100 kbps)", "7"),
+    ("Auto (melhor disponível)", "0"),
+    ("Alta (≈ 190 kbps)", "2"),
+    ("Média (≈ 130 kbps)", "5"),
+    ("Baixa (≈ 100 kbps)", "7"),
     ("128 kbps", "128K"),
     ("192 kbps", "192K"),
     ("256 kbps", "256K"),
@@ -345,8 +349,77 @@ def _format_hms(seconds: float | int | None) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _available_resolutions(info: dict | None) -> list[tuple[str, int | None]]:
+    """Extrai resoluções de vídeo realmente disponíveis a partir de info['formats']."""
+    if not info or "formats" not in info:
+        return QUALIDADES  # fallback estático
+
+    heights: set[int] = set()
+    for fmt in info["formats"]:
+        h = fmt.get("height")
+        if h and isinstance(h, (int, float)) and h > 0 and fmt.get("vcodec", "none") != "none":
+            heights.add(int(h))
+
+    if not heights:
+        return QUALIDADES
+
+    # Ordena do maior para o menor, monta labels
+    result: list[tuple[str, int | None]] = [("Auto (melhor disponível)", None)]
+    for h in sorted(heights, reverse=True):
+        label = _RES_LABELS.get(h, f"{h}p")
+        result.append((label, h))
+    return result
+
+
+# Chaves em info["subtitles"] que NÃO são legendas de verdade
+_NON_SUBTITLE_KEYS = {"live_chat"}
+
+
+def _available_subtitles(info: dict | None) -> tuple[
+    list[tuple[str, str]], list[tuple[str, str]]
+]:
+    """Retorna (manuais, automáticas) — cada uma como lista de (label, lang_code).
+
+    Ordena pt-BR/pt/en com prioridade.  Usa o campo ``name`` do yt-dlp
+    para exibir nomes legíveis (ex. "English (en)").
+    """
+    if not info:
+        return [], []
+
+    priority = {"pt-BR": 0, "pt": 1, "en": 2}
+
+    def _sorted(langs: list[str]) -> list[str]:
+        return sorted(langs, key=lambda l: (priority.get(l, 99), l))
+
+    def _lang_label(section: dict, lang: str) -> str:
+        entries = section.get(lang, [])
+        if entries and isinstance(entries, list):
+            name = entries[0].get("name") if isinstance(entries[0], dict) else None
+            if name:
+                return f"{name} ({lang})"
+        return lang
+
+    subs_dict = info.get("subtitles") or {}
+    auto_dict = info.get("automatic_captions") or {}
+
+    manual: list[tuple[str, str]] = []
+    for lang in _sorted(list(subs_dict.keys())):
+        if lang in _NON_SUBTITLE_KEYS:
+            continue
+        manual.append((_lang_label(subs_dict, lang), lang))
+
+    manual_codes = {l for _, l in manual}
+    auto: list[tuple[str, str]] = []
+    for lang in _sorted(list(auto_dict.keys())):
+        if lang not in manual_codes:
+            auto.append((_lang_label(auto_dict, lang), lang))
+
+    return manual, auto
+
+
 def render_download_options(key_prefix: str,
-                            duration_for_trim: float | None = None
+                            duration_for_trim: float | None = None,
+                            info: dict | None = None,
                             ) -> dict:
     """Renderiza os controles de qualidade/áudio/cortes. Retorna dict kwargs."""
 
@@ -366,16 +439,19 @@ def render_download_options(key_prefix: str,
         container = "mp4"
         audio_fmt = "mp3"
         audio_quality_val = "0"
+        selected_sub_langs: list[str] = []
 
         if mode in ("Vídeo + áudio", "Apenas vídeo"):
             st.markdown("**🎞️ Vídeo**")
+
+            available_q = _available_resolutions(info)
             quality_label = st.selectbox(
                 "Qualidade máxima do vídeo",
-                [lbl for lbl, _ in QUALIDADES],
+                [lbl for lbl, _ in available_q],
                 index=0,
                 key=f"{key_prefix}_quality",
             )
-            quality_h = dict(QUALIDADES)[quality_label]
+            quality_h = dict(available_q)[quality_label]
 
             container = st.selectbox(
                 "Formato do vídeo",
@@ -403,18 +479,100 @@ def render_download_options(key_prefix: str,
             )
             audio_quality_val = dict(AUDIO_QUALITIES)[audio_quality_label]
 
-            if audio_quality_label == "Melhor (VBR 0)":
-                st.caption("⚡ Qualidade máxima — download mais rápido (sem re-encode do áudio).")
+            if audio_quality_label == "Auto (melhor disponível)":
+                st.caption("⚡ Qualidade automática — download mais rápido (sem re-encode do áudio).")
 
-        if mode == "Apenas legendas":
+        # ---- Legendas: picker por idioma ----
+        show_subs_picker = mode in ("Vídeo + áudio", "Apenas vídeo", "Apenas legendas")
+        if show_subs_picker:
             st.markdown("**📝 Legendas**")
-            st.info("Serão baixadas legendas em pt, pt-BR e en (quando disponíveis).")
+            manual_subs, auto_subs = _available_subtitles(info)
+
+            if manual_subs or auto_subs:
+                want_subs = st.checkbox(
+                    "Baixar legendas",
+                    value=(mode == "Apenas legendas"),
+                    key=f"{key_prefix}_subs",
+                    disabled=(mode == "Apenas legendas"),
+                )
+
+                if want_subs or mode == "Apenas legendas":
+                    # Legendas do autor (manuais)
+                    if manual_subs:
+                        all_labels = [s[0] for s in manual_subs]
+                        label_to_lang = {s[0]: s[1] for s in manual_subs}
+
+                        # Default: pt-BR > pt > en (o primeiro encontrado)
+                        default_labels: list[str] = []
+                        for pref in ("pt-BR", "pt", "en"):
+                            match = [lbl for lbl, lang in manual_subs if lang == pref]
+                            if match:
+                                default_labels = match
+                                break
+
+                        selected_labels = st.multiselect(
+                            "Legendas do autor",
+                            all_labels,
+                            default=default_labels,
+                            key=f"{key_prefix}_sub_langs",
+                        )
+                        selected_sub_langs = [label_to_lang[lbl]
+                                              for lbl in selected_labels]
+                    else:
+                        st.caption("Este vídeo não possui legendas feitas pelo autor.")
+
+                    # Legendas automáticas (toggle)
+                    if auto_subs:
+                        show_auto = st.checkbox(
+                            "Incluir legendas geradas automaticamente",
+                            value=(not manual_subs),
+                            key=f"{key_prefix}_show_auto_subs",
+                            help="Legendas geradas por IA — podem conter erros.",
+                        )
+                        if show_auto:
+                            auto_labels = [s[0] for s in auto_subs]
+                            auto_label_to_lang = {s[0]: s[1] for s in auto_subs}
+
+                            # Default auto: pt-BR > pt > en
+                            auto_default: list[str] = []
+                            for pref in ("pt-BR", "pt", "en"):
+                                match = [lbl for lbl, lang in auto_subs
+                                         if lang == pref]
+                                if match:
+                                    auto_default = match
+                                    break
+
+                            selected_auto_labels = st.multiselect(
+                                "Legendas automáticas",
+                                auto_labels,
+                                default=auto_default,
+                                key=f"{key_prefix}_auto_sub_langs",
+                            )
+                            selected_sub_langs += [
+                                auto_label_to_lang[lbl]
+                                for lbl in selected_auto_labels
+                            ]
+
+                    if not selected_sub_langs:
+                        st.warning("Selecione ao menos um idioma de legenda.")
+            else:
+                want_subs = st.checkbox(
+                    "Baixar legendas",
+                    value=(mode == "Apenas legendas"),
+                    key=f"{key_prefix}_subs",
+                    disabled=(mode == "Apenas legendas"),
+                )
+                if want_subs or mode == "Apenas legendas":
+                    st.info("Nenhuma legenda encontrada para este vídeo. "
+                            "Serão buscadas pt, pt-BR e en automaticamente.")
+                    selected_sub_langs = ["pt", "pt-BR", "en"]
 
     # ---- Coluna B: cortes & extras ----
     with col_b:
         st.markdown("**✂️ Cortes & extras**")
         trim_enabled = st.checkbox(
             "Baixar apenas um trecho",
+            value=False,
             key=f"{key_prefix}_trim_en",
         )
 
@@ -438,14 +596,13 @@ def render_download_options(key_prefix: str,
                     key=f"{key_prefix}_trim_end",
                 )
 
-            # Tratar campo vazio como início/fim do vídeo
             start_str = start_txt.strip() if start_txt.strip() else "00:00:00"
             end_str = end_txt.strip() if end_txt.strip() else None
 
             try:
                 trim_start = core.parse_time_to_seconds(start_str)
                 if end_str is None:
-                    trim_end = None  # até o final do vídeo
+                    trim_end = None
                 else:
                     trim_end = core.parse_time_to_seconds(end_str)
                 if trim_end is not None and trim_start >= trim_end:
@@ -455,7 +612,7 @@ def render_download_options(key_prefix: str,
                 st.error(f"Tempo inválido: {e}. Use o formato HH:MM:SS (ex: 01:30:00).")
                 trim_error = True
 
-            if mode != "Apenas legendas":
+            if mode not in ("Apenas áudio", "Apenas legendas"):
                 keyframes = st.checkbox(
                     "Cortes precisos (re-encode)",
                     value=True,
@@ -475,19 +632,11 @@ def render_download_options(key_prefix: str,
         else:
             embed_thumb = False
 
-        is_subs_only = (mode == "Apenas legendas")
-        if not is_subs_only:
-            subtitles = st.checkbox(
-                "Baixar legendas (pt/pt-BR/en)",
-                value=False,
-                key=f"{key_prefix}_subs",
-            )
-        else:
-            subtitles = True
-
     # Monta dict de kwargs para build_options
     audio_only = (mode == "Apenas áudio")
-    subtitles_only = is_subs_only
+    subtitles_only = (mode == "Apenas legendas")
+    has_subs = bool(selected_sub_langs)
+
     if mode == "Apenas vídeo":
         if quality_h:
             format_spec = f"bestvideo[height<={quality_h}][ext={container}]/bestvideo[height<={quality_h}]/bestvideo"
@@ -496,7 +645,7 @@ def render_download_options(key_prefix: str,
     else:
         format_spec = _format_spec_for(quality_h, container)
 
-    return {
+    result: dict[str, Any] = {
         "format_spec": format_spec,
         "merge_format": container,
         "audio_only": audio_only,
@@ -506,10 +655,13 @@ def render_download_options(key_prefix: str,
         "trim_end": trim_end if not trim_error else None,
         "force_keyframes_at_cuts": keyframes,
         "embed_thumbnail": embed_thumb,
-        "write_subtitles": subtitles or subtitles_only,
+        "write_subtitles": has_subs or subtitles_only,
         "subtitles_only": subtitles_only,
         "_trim_error": trim_error,
     }
+    if selected_sub_langs:
+        result["subtitles_langs"] = selected_sub_langs
+    return result
 
 
 # ================================================================
@@ -579,6 +731,7 @@ def tab_single() -> None:
     opts_kwargs = render_download_options(
         "single",
         duration_for_trim=info.get("duration"),
+        info=info,
     )
 
     if st.button("⬇️  Baixar", type="primary", key="single_download",
@@ -633,7 +786,11 @@ def tab_multi() -> None:
                     )
 
         st.divider()
-        opts_kwargs = render_download_options("multi")
+        # Para múltiplos vídeos, usa o primeiro para resoluções/legendas disponíveis
+        opts_kwargs = render_download_options(
+            "multi",
+            info=infos[0] if infos else None,
+        )
 
         if st.button("⬇️  Baixar todos", type="primary", key="multi_download",
                      disabled=st.session_state.is_downloading):
@@ -781,8 +938,12 @@ def _dispatch_download(urls: list[str], opts_kwargs: dict,
     display_area.markdown("### ⏳ Baixando...")
     progress_slot = display_area.container()
 
-    rc, err = _run_download(urls, opts, progress_slot)
-    st.session_state.is_downloading = False
+    try:
+        rc, err = _run_download(urls, opts, progress_slot)
+    except Exception as e:
+        rc, err = 1, str(e)
+    finally:
+        st.session_state.is_downloading = False
 
     if rc == 0:
         display_area.success(

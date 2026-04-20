@@ -409,6 +409,11 @@ def build_options(
             "key": "FFmpegSubtitlesConvertor",
             "format": "srt",
         })
+        # Embutir legendas no container (somente quando há vídeo)
+        if not audio_only and not subtitles_only:
+            postprocessors.append({
+                "key": "FFmpegEmbedSubtitle",
+            })
 
     # Cookies
     if cookies_file and Path(cookies_file).exists():
@@ -441,6 +446,9 @@ def build_options(
         opts["_separate_subs"] = {
             "langs": _subs_langs,
         }
+        # Embutir legendas no container após o trimming
+        if not audio_only:
+            opts["_embed_subs"] = True
 
     if postprocessors:
         opts["postprocessors"] = postprocessors
@@ -496,6 +504,59 @@ def extract_playlist_flat(
 
 
 # ================================================================
+# Embutir legendas no container
+# ================================================================
+
+def _embed_subs_in_video(srt_files: Iterable[Path]) -> None:
+    """Embutem arquivos SRT no container de vídeo correspondente.
+
+    Agrupa por base do nome (``video.lang.srt`` → ``video``) e localiza
+    o arquivo de vídeo com mesmo stem.  Para cada grupo, executa ffmpeg
+    para adicionar as trilhas de legenda com metadado ``language``.
+    """
+    from collections import defaultdict
+
+    groups: dict[Path, list[tuple[str, Path]]] = defaultdict(list)
+    for srt in srt_files:
+        parts = srt.stem.rsplit(".", 1)
+        if len(parts) != 2:
+            continue
+        base, lang = parts
+        groups[srt.parent / base].append((lang, srt))
+
+    for base_path, langs in groups.items():
+        video_path: Path | None = None
+        for ext in (".mp4", ".mkv", ".webm", ".mov"):
+            candidate = base_path.with_suffix(ext)
+            if candidate.exists():
+                video_path = candidate
+                break
+        if not video_path:
+            continue
+
+        sub_codec = "mov_text" if video_path.suffix.lower() == ".mp4" else "srt"
+
+        cmd: list[str] = ["ffmpeg", "-y", "-i", str(video_path)]
+        maps = ["-map", "0"]
+        metadata: list[str] = []
+        for i, (lang, srt_path) in enumerate(langs):
+            cmd += ["-i", str(srt_path)]
+            maps += ["-map", str(i + 1)]
+            metadata += [f"-metadata:s:s:{i}", f"language={lang}"]
+
+        tmp_path = video_path.with_name(video_path.stem + ".tmp" + video_path.suffix)
+        cmd += maps + ["-c", "copy", "-c:s", sub_codec] + metadata + [str(tmp_path)]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            video_path.unlink()
+            tmp_path.rename(video_path)
+        except subprocess.CalledProcessError:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+
+# ================================================================
 # Download
 # ================================================================
 
@@ -508,12 +569,13 @@ def download(urls: Iterable[str], opts: dict) -> int:
     opts = dict(opts)  # não muta o dict do chamador
     subtitle_trim = opts.pop("_subtitle_trim", None)
     separate_subs = opts.pop("_separate_subs", None)
+    embed_subs = opts.pop("_embed_subs", False)
 
-    # Rastreia legendas existentes para trimming posterior
+    # Rastreia legendas existentes para trimming/embedding posterior
     outtmpl = opts.get("outtmpl", "%(title)s.%(ext)s")
     output_dir = Path(outtmpl).parent
     pre_subs: set[Path] = set()
-    if subtitle_trim and output_dir.exists():
+    if (subtitle_trim or embed_subs) and output_dir.exists():
         pre_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
 
     # ---- Passo 1: download principal (vídeo/áudio, SEM legendas se trim ativo) ----
@@ -544,14 +606,23 @@ def download(urls: Iterable[str], opts: dict) -> int:
         with yt_dlp.YoutubeDL(subs_opts) as ydl:
             ydl.download(urls)  # ignora retcode das legendas
 
-    # ---- Passo 3: recorta legendas criadas neste download ----
-    if subtitle_trim and output_dir.exists():
+    # ---- Passo 3: identifica legendas novas e recorta se necessário ----
+    new_subs: set[Path] = set()
+    if (subtitle_trim or embed_subs) and output_dir.exists():
         post_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
-        for sub_file in (post_subs - pre_subs):
-            _trim_subtitle_file(
-                sub_file,
-                subtitle_trim["trim_start"],
-                subtitle_trim["trim_end"],
-            )
+        new_subs = post_subs - pre_subs
+        if subtitle_trim:
+            for sub_file in new_subs:
+                _trim_subtitle_file(
+                    sub_file,
+                    subtitle_trim["trim_start"],
+                    subtitle_trim["trim_end"],
+                )
+
+    # ---- Passo 4: embutir legendas no container (trim + legendas) ----
+    if embed_subs and new_subs:
+        srt_only = [f for f in new_subs if f.suffix == ".srt"]
+        if srt_only:
+            _embed_subs_in_video(srt_only)
 
     return rc
