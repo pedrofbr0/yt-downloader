@@ -126,7 +126,7 @@ def parse_time_to_seconds(s: str | int | float) -> float:
 
 
 def format_duration(seconds: float | int | None) -> str:
-    if not seconds or seconds < 0:
+    if seconds is None or seconds < 0:
         return "?"
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
@@ -135,7 +135,7 @@ def format_duration(seconds: float | int | None) -> str:
 
 
 def format_bytes(n: float | int | None) -> str:
-    if not n:
+    if n is None:
         return "?"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024:
@@ -367,6 +367,18 @@ def build_options(
     else:
         opts["format"] = format_spec
         opts["merge_output_format"] = merge_format
+        # Re-encode áudio com qualidade específica (preserva vídeo)
+        if audio_quality != "0":
+            # Converte VBR (0-9) para bitrate aproximado para o merge
+            _vbr_to_kbps = {"2": "192", "5": "128", "7": "100", "9": "64"}
+            if audio_quality.upper().endswith("K"):
+                abr = audio_quality.upper()  # ex: "192K"
+            else:
+                abr = _vbr_to_kbps.get(audio_quality, "192") + "K"
+            opts.setdefault("postprocessor_args", {})
+            opts["postprocessor_args"]["merger"] = [
+                "-c:v", "copy", "-b:a", abr.lower(),
+            ]
 
     # Metadata / thumbnail (apenas quando baixa mídia)
     if not subtitles_only:

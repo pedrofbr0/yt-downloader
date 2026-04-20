@@ -121,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     # Extras
     p.add_argument("--subs", action="store_true",
                    help="Também baixa legendas.")
+    p.add_argument("--subs-only", action="store_true",
+                   help="Baixa APENAS legendas (sem vídeo/áudio).")
     p.add_argument("--embed-thumbnail", action="store_true",
                    help="Embute a thumbnail no arquivo final.")
 
@@ -189,7 +191,8 @@ def main(argv: list[str] | None = None) -> int:
         trim_start=trim_start,
         trim_end=trim_end,
         force_keyframes_at_cuts=not args.no_keyframes,
-        write_subtitles=args.subs,
+        write_subtitles=args.subs or args.subs_only,
+        subtitles_only=args.subs_only,
         embed_thumbnail=args.embed_thumbnail,
         progress_hook=_progress_hook,
         quiet=False,
