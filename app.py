@@ -17,6 +17,7 @@ Pré-requisitos do sistema (ver sidebar "Status do ambiente"):
 from __future__ import annotations
 
 import queue
+import subprocess
 import tempfile
 import threading
 import time
@@ -51,6 +52,9 @@ def _init_state() -> None:
         "playlist_info": None,
         "download_log": [],
         "is_downloading": False,
+        "output_dir": str(Path.cwd() / "downloads"),
+        "browser": "firefox",
+        "cookies_upload": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -107,6 +111,98 @@ def _format_spec_for(quality_height: int | None, container: str) -> str:
     return core.format_spec_by_quality(quality_height, container)
 
 
+def _ask_directory_popup(initial_dir: str | None = None) -> str | None:
+    """Abre seletor nativo de pasta e retorna o caminho escolhido."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+
+    try:
+        root = tk.Tk()
+    except Exception:
+        return _ask_directory_popup_powershell(initial_dir)
+
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        selected = filedialog.askdirectory(
+            title="Escolha a pasta de downloads",
+            initialdir=initial_dir or str(Path.cwd()),
+            mustexist=True,
+        )
+    finally:
+        root.destroy()
+
+    return selected or None
+
+
+def _ask_directory_popup_powershell(initial_dir: str | None = None) -> str | None:
+    """Fallback no Windows usando seletor nativo do Explorer via PowerShell."""
+    shell_pick = _ask_directory_popup_shell(initial_dir)
+    if shell_pick:
+        return shell_pick
+
+    # Fallback secundário para ambientes onde o COM do Shell não responde.
+    return _ask_directory_popup_winforms(initial_dir)
+
+
+def _ask_directory_popup_shell(initial_dir: str | None = None) -> str | None:
+    """Usa Shell.Application.BrowseForFolder (Explorer), com raiz em 'Este Computador'."""
+    init = str(initial_dir or Path.cwd())
+    init_ps = init.replace("'", "''")
+    script = (
+        "$shell = New-Object -ComObject Shell.Application; "
+        # 0x0051 = RETURNONLYFSDIRS + EDITBOX + NEWDIALOGSTYLE
+        "$flags = 0x0051; "
+        # 17 = 'My Computer' (permite navegar entre drives)
+        "$folder = $shell.BrowseForFolder(0, 'Escolha a pasta de downloads', $flags, 17); "
+        "if ($folder) { [Console]::WriteLine($folder.Self.Path) }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        picked = (out.stdout or "").strip()
+        return picked or None
+    except Exception:
+        return None
+
+
+def _ask_directory_popup_winforms(initial_dir: str | None = None) -> str | None:
+    """Fallback usando FolderBrowserDialog."""
+    init = str(initial_dir or Path.cwd())
+    # Escapa aspas simples para string literal no PowerShell.
+    init_ps = init.replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+        f"$dialog.SelectedPath = '{init_ps}'; "
+        "$dialog.ShowNewFolderButton = $true; "
+        "$result = $dialog.ShowDialog(); "
+        "if ($result -eq [System.Windows.Forms.DialogResult]::OK) { "
+        "  [Console]::WriteLine($dialog.SelectedPath) "
+        "}"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        picked = (out.stdout or "").strip()
+        return picked or None
+    except Exception:
+        return None
+
+
 # ================================================================
 # SIDEBAR — Status & configuração global
 # ================================================================
@@ -152,12 +248,21 @@ def render_sidebar() -> None:
 
     # ---- Config geral ----
     st.sidebar.subheader("Opções gerais")
-    st.session_state["output_dir"] = st.sidebar.text_input(
+    st.sidebar.text_input(
         "Pasta de saída",
-        value=st.session_state.get(
-            "output_dir", str(Path.cwd() / "downloads")),
+        key="output_dir",
         help="Onde os arquivos baixados serão salvos.",
     )
+    if st.sidebar.button("📂 Escolher pasta por popup"):
+        selected_dir = _ask_directory_popup(st.session_state.get("output_dir"))
+        if selected_dir:
+            st.session_state["output_dir"] = selected_dir
+            st.rerun()
+        else:
+            st.sidebar.info(
+                "Nenhuma pasta foi selecionada ou o popup não está disponível neste ambiente."
+            )
+
     st.session_state["browser"] = st.sidebar.selectbox(
         "Navegador (cookies)",
         NAVEGADORES,
