@@ -264,12 +264,16 @@ def format_spec_by_quality(
     Gera format spec com fallback robusto.
       - max_height=None   → melhor disponível
       - max_height=1080   → melhor até 1080p
+
+    Não filtra o vídeo por ext: bestvideo[ext=mp4] seleciona streams
+    progressivos do YouTube que só funcionam com range requests (trim).
+    Sem o filtro, yt-dlp usa DASH/VP9 que funciona em downloads completos
+    e parciais igualmente. O container de saída é controlado por
+    merge_output_format no build_options.
     """
     height_filter = f"[height<={max_height}]" if max_height else ""
-    ext_filter = f"[ext={container}]" if container else ""
-    # Tenta: mp4+m4a → qualquer vídeo+áudio → best single
     return (
-        f"bestvideo{height_filter}{ext_filter}+bestaudio[ext=m4a]"
+        f"bestvideo{height_filter}+bestaudio[ext=m4a]"
         f"/bestvideo{height_filter}+bestaudio"
         f"/best{height_filter}"
         f"/best"
@@ -285,21 +289,24 @@ BASE_OPTS: dict[str, Any] = {
     "retries": 10,
     "fragment_retries": 10,
     "extractor_retries": 5,
-    "file_access_retries": 5,
+    "file_access_retries": 30,  # Windows Defender pode segurar o arquivo por vários segundos
     "concurrent_fragment_downloads": 4,
     "http_chunk_size": 10 * 1024 * 1024,
     "quiet": True,
     "no_warnings": False,
     "ignoreerrors": False,
+    "keeppartialfiles": False,  # limpa .part e .ytdl em caso de falha
 
     # Runtime JS + EJS (essencial desde yt-dlp 2025.11.12)
     "js_runtimes": {"deno": {}},
     "remote_components": {"ejs:github"},
 
-    # Clientes InnerTube estáveis
+    # android_vr: fornece DASH completo (vídeo-only + áudio-only) sem DRM
+    # e sem exigir PO Token ou JS challenge.  tv e mweb removidos por
+    # experimentação DRM do YouTube que bloqueia segmentos no meio do download.
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv", "web_safari", "mweb"],
+            "player_client": ["android_vr", "web_safari"],
         }
     },
     "http_headers": {
@@ -344,6 +351,7 @@ def build_options(
 
     opts: dict[str, Any] = {**BASE_OPTS, "quiet": quiet, "verbose": verbose}
     opts["noplaylist"] = not playlist
+    opts["overwrites"] = True  # sempre sobrescreve para evitar skip silencioso quando arquivo já existe
 
     # Template de nome de arquivo
     if outtmpl is None:
@@ -570,6 +578,7 @@ def download(urls: Iterable[str], opts: dict) -> int:
     subtitle_trim = opts.pop("_subtitle_trim", None)
     separate_subs = opts.pop("_separate_subs", None)
     embed_subs = opts.pop("_embed_subs", False)
+    notify = opts.pop("_notify", None)  # Optional[Callable[[str], None]]
 
     # Rastreia legendas existentes para trimming/embedding posterior
     outtmpl = opts.get("outtmpl", "%(title)s.%(ext)s")
@@ -584,6 +593,8 @@ def download(urls: Iterable[str], opts: dict) -> int:
 
     # ---- Passo 2: legendas separadas (quando trim + legendas juntos) ----
     if separate_subs is not None:
+        if notify:
+            notify("⬇️ Baixando legendas…")
         subs_opts = {**BASE_OPTS, "quiet": opts.get("quiet", True)}
         subs_opts["skip_download"] = True
         subs_opts["writesubtitles"] = True
@@ -596,12 +607,11 @@ def download(urls: Iterable[str], opts: dict) -> int:
             "key": "FFmpegSubtitlesConvertor",
             "format": "srt",
         }]
-        # Cookies (copiar do opts original)
-        for ck in ("cookiefile", "cookiesfrombrowser"):
-            if ck in opts:
-                subs_opts[ck] = opts[ck]
-        if "playlist_items" in opts:
-            subs_opts["playlist_items"] = opts["playlist_items"]
+        # Propagar hooks, cookies e logger do opts original
+        for key in ("cookiefile", "cookiesfrombrowser", "playlist_items",
+                    "progress_hooks", "postprocessor_hooks", "logger"):
+            if key in opts:
+                subs_opts[key] = opts[key]
 
         with yt_dlp.YoutubeDL(subs_opts) as ydl:
             ydl.download(urls)  # ignora retcode das legendas
@@ -612,6 +622,8 @@ def download(urls: Iterable[str], opts: dict) -> int:
         post_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
         new_subs = post_subs - pre_subs
         if subtitle_trim:
+            if notify:
+                notify("✂️ Ajustando tempo das legendas…")
             for sub_file in new_subs:
                 _trim_subtitle_file(
                     sub_file,
@@ -623,6 +635,8 @@ def download(urls: Iterable[str], opts: dict) -> int:
     if embed_subs and new_subs:
         srt_only = [f for f in new_subs if f.suffix == ".srt"]
         if srt_only:
+            if notify:
+                notify("📦 Embutindo legendas no vídeo…")
             _embed_subs_in_video(srt_only)
 
     return rc

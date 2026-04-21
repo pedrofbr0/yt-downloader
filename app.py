@@ -17,6 +17,7 @@ Pré-requisitos do sistema (ver sidebar "Status do ambiente"):
 from __future__ import annotations
 
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -288,6 +289,38 @@ Se nada funciona mesmo com tudo certo, teste:
 # Progress display
 # ================================================================
 
+# Strips ANSI/VT100 colour codes that yt-dlp may embed in error messages.
+# Matches both  \x1b[0;31m  (with ESC byte)  and  [0;31m  (ESC stripped by terminal).
+_ANSI_RE = re.compile(r"(?:\x1b|\033)?\[[\d;]*[mKHJA-Za-z]")
+
+_PP_LABELS: dict[str, str] = {
+    "FFmpegMergerPP":            "Unindo vídeo e áudio",
+    "FFmpegEmbedSubtitle":       "Embutindo legendas",
+    "FFmpegSubtitlesConvertor":  "Convertendo legendas",
+    "FFmpegExtractAudio":        "Extraindo áudio",
+    "FFmpegMetadata":            "Adicionando metadados",
+    "EmbedThumbnail":            "Embutindo capa",
+    "FFmpegFixupM3u8":           "Corrigindo formato HLS",
+    "FFmpegFixupM4a":            "Corrigindo formato M4A",
+    "FFmpegFixupTimestamp":      "Corrigindo timestamps",
+    "FFmpegFixupDuration":       "Corrigindo duração",
+    "FFmpegFixupStretchedAudio": "Corrigindo áudio",
+    "FFmpegCopyStream":          "Copiando stream",
+    "FFmpegVideoConvertorPP":    "Convertendo vídeo",
+    "FFmpegVideoRemuxerPP":      "Remuxando vídeo",
+    "MoveFilesAfterDownload":    "Organizando arquivos",
+    "FFmpegThumbnailsConvertor": "Convertendo thumbnail",
+    "FFmpegSplitChapters":       "Dividindo por capítulos",
+}
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s:02d}s"
+
+
 class StreamlitProgress:
     """Encapsula os placeholders do Streamlit para mostrar progresso."""
 
@@ -295,44 +328,105 @@ class StreamlitProgress:
         self.container = container
         self.bar = container.progress(0.0)
         self.status = container.empty()
-        self.log = container.empty()
-        self._log_lines: list[str] = []
+        self.log_display = container.empty()
+        self._log: list[str] = []
+        self._current_pp: str | None = None
+        self._pp_start: float | None = None
+        self._dl_start: float | None = None  # start of current file download
+
+    def _push_log(self, msg: str) -> None:
+        self._log.append(msg)
+        self.log_display.markdown("\n\n".join(self._log[-12:]))
 
     def hook(self, d: dict) -> None:
         status = d.get("status")
         if status == "downloading":
+            if self._dl_start is None:
+                self._dl_start = time.monotonic()
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes") or 0
             frac = (done / total) if total else 0.0
             self.bar.progress(min(frac, 1.0))
             speed = core.format_bytes(d.get("speed") or 0) + "/s"
             eta = d.get("eta") or 0
+            elapsed = _fmt_elapsed(time.monotonic() - self._dl_start)
             fn = Path(d.get("filename", "")).name
             self.status.markdown(
-                f"⬇ **{fn}**\n\n"
-                f"{core.format_bytes(done)} / {core.format_bytes(total)} "
-                f"• {speed} • ETA {core.format_duration(eta)}"
+                f"⬇️ **Baixando:** `{fn}`  \n"
+                f"{core.format_bytes(done)} / {core.format_bytes(total)}"
+                f" • {speed} • ETA {core.format_duration(eta)} • ⏱ {elapsed}"
             )
         elif status == "finished":
-            self.bar.progress(1.0)
             fn = Path(d.get("filename", "")).name
-            self._log_lines.append(f"✅ {fn} — concluído, pós-processando…")
-            self.log.markdown("\n".join(self._log_lines[-10:]))
+            elapsed_str = (
+                f" — ⏱ {_fmt_elapsed(time.monotonic() - self._dl_start)}"
+                if self._dl_start else ""
+            )
+            self._push_log(f"✅ **{fn}** baixado{elapsed_str}")
+            self.bar.progress(1.0)
+            self.status.empty()
+            self._dl_start = None
         elif status == "error":
-            self._log_lines.append(f"❌ erro: {d.get('filename')}")
-            self.log.markdown("\n".join(self._log_lines[-10:]))
+            fn = d.get("filename", "") or ""
+            self._push_log(f"❌ Erro: `{Path(fn).name if fn else '?'}`")
+
+    def postprocessor_hook(self, d: dict) -> None:
+        pp = d.get("postprocessor", "")
+        label = _PP_LABELS.get(pp)
+        if label is None:
+            return  # ignore internal/unlisted postprocessors silently
+        status = d.get("status")
+
+        if status == "started":
+            self._current_pp = label
+            self._pp_start = time.monotonic()
+            fn = Path(d.get("info_dict", {}).get("filepath", "") or "").name
+            text = f"⚙️ **{label}{'…' if not fn else f': {fn}…'}**"
+            self.status.markdown(text)
+            self.bar.progress(1.0)
+        elif status == "finished":
+            if self._current_pp:
+                elapsed_str = (
+                    f" — ⏱ {_fmt_elapsed(time.monotonic() - self._pp_start)}"
+                    if self._pp_start else ""
+                )
+                self._push_log(f"✅ {self._current_pp} concluído{elapsed_str}")
+                self._current_pp = None
+                self._pp_start = None
+            self.status.empty()
+
+    def notify(self, msg: str) -> None:
+        self.bar.progress(0.0)  # reset bar for new download phase
+        self.status.markdown(msg)
 
 
 def _run_download(urls: list[str], opts_without_hook: dict,
                   display_container: Any) -> tuple[int, str | None]:
     """Executa o download com barra de progresso. Retorna (retcode, erro)."""
     progress = StreamlitProgress(display_container)
-    opts = {**opts_without_hook, "progress_hooks": [progress.hook]}
+
+    _ydl_errors: list[str] = []
+
+    class _Logger:
+        def debug(self, msg: str) -> None: pass
+        def info(self, msg: str) -> None: pass
+        def warning(self, msg: str) -> None: pass
+        def error(self, msg: str) -> None:
+            _ydl_errors.append(_ANSI_RE.sub("", msg))
+
+    opts = {
+        **opts_without_hook,
+        "progress_hooks": [progress.hook],
+        "postprocessor_hooks": [progress.postprocessor_hook],
+        "_notify": progress.notify,
+        "logger": _Logger(),
+    }
     try:
         rc = core.download(urls, opts)
-        return rc, None
+        err = _ydl_errors[-1] if _ydl_errors and rc != 0 else None
+        return rc, err
     except Exception as e:
-        return 1, str(e)
+        return 1, _ANSI_RE.sub("", str(e))
 
 
 # ================================================================
@@ -639,9 +733,9 @@ def render_download_options(key_prefix: str,
 
     if mode == "Apenas vídeo":
         if quality_h:
-            format_spec = f"bestvideo[height<={quality_h}][ext={container}]/bestvideo[height<={quality_h}]/bestvideo"
+            format_spec = f"bestvideo[height<={quality_h}]/bestvideo"
         else:
-            format_spec = f"bestvideo[ext={container}]/bestvideo"
+            format_spec = "bestvideo"
     else:
         format_spec = _format_spec_for(quality_h, container)
 
@@ -673,7 +767,7 @@ def render_video_preview(info: dict) -> None:
     with col1:
         thumb = info.get("thumbnail")
         if thumb:
-            st.image(thumb, use_container_width=True)
+            st.image(thumb, width="stretch")
     with col2:
         st.markdown(f"### {info.get('title', '(sem título)')}")
         uploader = info.get("uploader") or info.get("channel") or "?"
@@ -705,7 +799,7 @@ def tab_single() -> None:
     with col_btn:
         st.write("")  # espaçador
         st.write("")
-        if st.button("🔍 Analisar", use_container_width=True,
+        if st.button("🔍 Analisar", width="stretch",
                      key="single_analyze"):
             if url.strip():
                 with st.spinner("Buscando informações (pode levar alguns segundos)..."):
@@ -814,7 +908,7 @@ def tab_playlist() -> None:
     with col_btn:
         st.write("")
         st.write("")
-        if st.button("🔍 Listar", key="pl_analyze", use_container_width=True):
+        if st.button("🔍 Listar", key="pl_analyze", width="stretch"):
             if pl_url.strip():
                 with st.spinner("Buscando playlist..."):
                     try:
@@ -938,6 +1032,7 @@ def _dispatch_download(urls: list[str], opts_kwargs: dict,
     display_area.markdown("### ⏳ Baixando...")
     progress_slot = display_area.container()
 
+    _t0 = time.monotonic()
     try:
         rc, err = _run_download(urls, opts, progress_slot)
     except Exception as e:
@@ -945,17 +1040,31 @@ def _dispatch_download(urls: list[str], opts_kwargs: dict,
     finally:
         st.session_state.is_downloading = False
 
+    total_elapsed = _fmt_elapsed(time.monotonic() - _t0)
     if rc == 0:
         display_area.success(
-            f"✅ Download concluído em: `{st.session_state['output_dir']}`"
+            f"✅ Download concluído em: `{st.session_state['output_dir']}` "
+            f"— ⏱ tempo total: **{total_elapsed}**"
         )
         st.balloons()
     else:
-        display_area.error(f"❌ Falhou: {err or f'retcode={rc}'}")
-        display_area.info(
-            "Cheque se o Deno está instalado, se os cookies do Firefox "
-            "estão válidos (refaça o ritual) e se o yt-dlp está atualizado."
-        )
+        err_msg = err or f"retcode={rc}"
+        display_area.error(f"❌ Falhou após {total_elapsed}: {err_msg}")
+        _is_file_lock = any(k in (err_msg or "") for k in
+                            ("WinError 32", "sendo usado", "being used by another process",
+                             "Unable to rename"))
+        if _is_file_lock:
+            display_area.warning(
+                "🛡️ **Windows Defender / Indexação** está bloqueando a renomeação do arquivo.\n\n"
+                "**Solução permanente:** adicione a pasta de downloads às exclusões do Defender:\n"
+                "Segurança do Windows → Proteção contra vírus e ameaças → "
+                "Configurações de proteção → Exclusões → Adicionar pasta."
+            )
+        else:
+            display_area.info(
+                "Cheque se o Deno está instalado, se os cookies do Firefox "
+                "estão válidos (refaça o ritual) e se o yt-dlp está atualizado."
+            )
 
 
 # ================================================================
