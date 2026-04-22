@@ -16,6 +16,7 @@ Pré-requisitos do sistema (ver sidebar "Status do ambiente"):
 
 from __future__ import annotations
 
+import os
 import queue
 import re
 import subprocess
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+import yt_dlp
 
 import youtube_downloader as core
 
@@ -51,12 +53,25 @@ def _init_state() -> None:
         "single_info": None,
         "multi_infos": [],
         "playlist_info": None,
-        "download_log": [],
-        "is_downloading": False,
         "output_dir": str(Path.cwd() / "downloads"),
         "output_dir_input": str(Path.cwd() / "downloads"),
         "browser": "firefox",
         "cookies_upload": None,
+        # download state
+        "dl_state": "idle",       # "idle"|"running"|"cancelling"|"done"|"error"|"cancelled"
+        "dl_queue": None,         # queue.Queue
+        "dl_cancel": None,        # threading.Event
+        "dl_thread": None,        # threading.Thread
+        "dl_log": [],
+        "dl_bar": 0.0,
+        "dl_status": "",
+        "dl_t0": 0.0,
+        "dl_err": None,
+        "dl_output_dir": "",
+        "dl_confirm_pending": None,  # dict when confirmation needed to start new download
+        "dl_balloons_shown": False,   # prevents balloons from re-firing on reruns
+        "dl_pp_label": None,          # label of current postprocessor (for live elapsed)
+        "dl_pp_start": None,          # monotonic timestamp when current PP started
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -69,6 +84,58 @@ _init_state()
 # ================================================================
 # Helpers
 # ================================================================
+
+def _next_available_suffix(expected: Path) -> str:
+    """'' se expected livre; ' (N)' com próximo N livre caso contrário.
+
+    Usado para nomear o NOVO download com (N) em vez de renomear os antigos.
+    """
+    if not expected.exists():
+        return ""
+    n = 1
+    while expected.with_name(f"{expected.stem} ({n}){expected.suffix}").exists():
+        n += 1
+    return f" ({n})"
+
+
+def _kill_ffmpeg_children() -> None:
+    """Terminate ffmpeg.exe processes spawned by our Python process.
+
+    yt-dlp runs ffmpeg via subprocess.Popen as a child of the current process,
+    so filtering by ParentProcessId avoids killing unrelated ffmpeg instances.
+    Without this, cancelling during a long ffmpeg run (conversion, merge, embed)
+    has to wait for ffmpeg to finish before the worker thread returns.
+    """
+    try:
+        pid = os.getpid()
+        script = (
+            f"Get-CimInstance Win32_Process -Filter "
+            f"\"Name='ffmpeg.exe' AND ParentProcessId={pid}\" | "
+            f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
+            f"-ErrorAction SilentlyContinue }}"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, timeout=5, check=False,
+        )
+    except Exception:
+        pass
+
+
+_PARTIAL_PATTERNS = ("*.part", "*.ytdl", "*.part-Frag*", "*.frag", "*.tmp")
+
+
+def _cleanup_partial_files(output_dir: Path) -> None:
+    """Remove leftover .part/.ytdl/.frag files after a cancelled download."""
+    if not output_dir.exists():
+        return
+    for pattern in _PARTIAL_PATTERNS:
+        for f in output_dir.rglob(pattern):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
 
 QUALIDADES = [
     ("Auto (melhor disponível)", None),
@@ -286,31 +353,34 @@ Se nada funciona mesmo com tudo certo, teste:
 
 
 # ================================================================
-# Progress display
+# Progress display — queue-based (thread-safe)
 # ================================================================
 
-# Strips ANSI/VT100 colour codes that yt-dlp may embed in error messages.
-# Matches both  \x1b[0;31m  (with ESC byte)  and  [0;31m  (ESC stripped by terminal).
 _ANSI_RE = re.compile(r"(?:\x1b|\033)?\[[\d;]*[mKHJA-Za-z]")
 
+# Keys match yt-dlp's PostProcessor.pp_key() — the FFmpeg prefix is stripped
+# and the PP suffix is removed by yt-dlp before the hook fires.
 _PP_LABELS: dict[str, str] = {
-    "FFmpegMergerPP":            "Unindo vídeo e áudio",
-    "FFmpegEmbedSubtitle":       "Embutindo legendas",
-    "FFmpegSubtitlesConvertor":  "Convertendo legendas",
-    "FFmpegExtractAudio":        "Extraindo áudio",
-    "FFmpegMetadata":            "Adicionando metadados",
-    "EmbedThumbnail":            "Embutindo capa",
-    "FFmpegFixupM3u8":           "Corrigindo formato HLS",
-    "FFmpegFixupM4a":            "Corrigindo formato M4A",
-    "FFmpegFixupTimestamp":      "Corrigindo timestamps",
-    "FFmpegFixupDuration":       "Corrigindo duração",
-    "FFmpegFixupStretchedAudio": "Corrigindo áudio",
-    "FFmpegCopyStream":          "Copiando stream",
-    "FFmpegVideoConvertorPP":    "Convertendo vídeo",
-    "FFmpegVideoRemuxerPP":      "Remuxando vídeo",
-    "MoveFilesAfterDownload":    "Organizando arquivos",
-    "FFmpegThumbnailsConvertor": "Convertendo thumbnail",
-    "FFmpegSplitChapters":       "Dividindo por capítulos",
+    "Merger":                 "Unindo vídeo e áudio",
+    "EmbedSubtitle":          "Embutindo legendas",
+    "SubtitlesConvertor":     "Convertendo legendas",
+    "ExtractAudio":           "Extraindo áudio",
+    "Metadata":               "Adicionando metadados",
+    "EmbedThumbnail":         "Embutindo capa",
+    "FixupM3u8":              "Corrigindo formato HLS",
+    "FixupM4a":               "Corrigindo formato M4A",
+    "FixupTimestamp":         "Corrigindo timestamps",
+    "FixupDuration":          "Corrigindo duração",
+    "FixupStretched":         "Corrigindo áudio",
+    "FixupDuplicateMoov":     "Corrigindo container MP4",
+    "CopyStream":             "Copiando stream",
+    "VideoConvertor":         "Convertendo vídeo",
+    "VideoRemuxer":           "Remuxando vídeo",
+    "MoveFilesAfterDownload": "Organizando arquivos",
+    "ThumbnailsConvertor":    "Convertendo thumbnail",
+    "SplitChapters":          "Dividindo por capítulos",
+    "ModifyChapters":         "Cortando vídeo (trim)",
+    "Concat":                 "Concatenando arquivos",
 }
 
 
@@ -321,24 +391,39 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
-class StreamlitProgress:
-    """Encapsula os placeholders do Streamlit para mostrar progresso."""
+def _stream_label(d: dict) -> str:
+    """Returns a human-readable label for the stream being downloaded."""
+    info = d.get("info_dict") or {}
+    vcodec = info.get("vcodec") or "none"
+    acodec = info.get("acodec") or "none"
+    has_video = vcodec != "none"
+    has_audio = acodec != "none"
+    if has_video and has_audio:
+        return "🎬🔊 Baixando vídeo+áudio"
+    if has_video:
+        res = info.get("height")
+        return f"🎬 Baixando vídeo{f' ({res}p)' if res else ''}"
+    if has_audio:
+        return "🔊 Baixando áudio"
+    return "⬇️ Baixando"
 
-    def __init__(self, container: Any):
-        self.container = container
-        self.bar = container.progress(0.0)
-        self.status = container.empty()
-        self.log_display = container.empty()
-        self._log: list[str] = []
+
+class _QueueProgress:
+    """Writes progress updates to a queue instead of Streamlit directly."""
+
+    def __init__(self, q: queue.Queue, cancel: threading.Event):
+        self._q = q
+        self._cancel = cancel
+        self._dl_start: float | None = None
         self._current_pp: str | None = None
         self._pp_start: float | None = None
-        self._dl_start: float | None = None  # start of current file download
 
-    def _push_log(self, msg: str) -> None:
-        self._log.append(msg)
-        self.log_display.markdown("\n\n".join(self._log[-12:]))
+    def _put(self, msg: dict) -> None:
+        self._q.put_nowait(msg)
 
     def hook(self, d: dict) -> None:
+        if self._cancel.is_set():
+            raise SystemExit("cancelled")  # BaseException, bypasses yt-dlp's except Exception
         status = d.get("status")
         if status == "downloading":
             if self._dl_start is None:
@@ -346,65 +431,84 @@ class StreamlitProgress:
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes") or 0
             frac = (done / total) if total else 0.0
-            self.bar.progress(min(frac, 1.0))
             speed = core.format_bytes(d.get("speed") or 0) + "/s"
             eta = d.get("eta") or 0
             elapsed = _fmt_elapsed(time.monotonic() - self._dl_start)
+            stream_lbl = _stream_label(d)
             fn = Path(d.get("filename", "")).name
-            self.status.markdown(
-                f"⬇️ **Baixando:** `{fn}`  \n"
-                f"{core.format_bytes(done)} / {core.format_bytes(total)}"
-                f" • {speed} • ETA {core.format_duration(eta)} • ⏱ {elapsed}"
-            )
+            self._put({
+                "type": "progress",
+                "bar": min(frac, 1.0),
+                "status": (
+                    f"{stream_lbl}: `{fn}`  \n"
+                    f"{core.format_bytes(done)} / {core.format_bytes(total)}"
+                    f" • {speed} • ETA {core.format_duration(eta)} • ⏱ {elapsed}"
+                ),
+            })
         elif status == "finished":
             fn = Path(d.get("filename", "")).name
             elapsed_str = (
                 f" — ⏱ {_fmt_elapsed(time.monotonic() - self._dl_start)}"
                 if self._dl_start else ""
             )
-            self._push_log(f"✅ **{fn}** baixado{elapsed_str}")
-            self.bar.progress(1.0)
-            self.status.empty()
+            self._put({"type": "log", "msg": f"✅ **{fn}** baixado{elapsed_str}"})
+            # Placeholder while ffmpeg postprocessor starts — overwritten when
+            # the postprocessor_hook fires "started" with a specific label.
+            self._put({
+                "type": "progress",
+                "bar": 1.0,
+                "status": "⚙️ **Processando com ffmpeg…**",
+            })
             self._dl_start = None
         elif status == "error":
             fn = d.get("filename", "") or ""
-            self._push_log(f"❌ Erro: `{Path(fn).name if fn else '?'}`")
+            self._put({"type": "log", "msg": f"❌ Erro: `{Path(fn).name if fn else '?'}`"})
 
     def postprocessor_hook(self, d: dict) -> None:
+        if self._cancel.is_set():
+            raise SystemExit("cancelled")
         pp = d.get("postprocessor", "")
         label = _PP_LABELS.get(pp)
         if label is None:
-            return  # ignore internal/unlisted postprocessors silently
+            return
         status = d.get("status")
-
         if status == "started":
             self._current_pp = label
             self._pp_start = time.monotonic()
             fn = Path(d.get("info_dict", {}).get("filepath", "") or "").name
-            text = f"⚙️ **{label}{'…' if not fn else f': {fn}…'}**"
-            self.status.markdown(text)
-            self.bar.progress(1.0)
+            self._put({
+                "type": "pp_start",
+                "label": label,
+                "filename": fn,
+                "start": self._pp_start,
+            })
         elif status == "finished":
             if self._current_pp:
                 elapsed_str = (
                     f" — ⏱ {_fmt_elapsed(time.monotonic() - self._pp_start)}"
                     if self._pp_start else ""
                 )
-                self._push_log(f"✅ {self._current_pp} concluído{elapsed_str}")
+                self._put({"type": "log", "msg": f"✅ {self._current_pp} concluído{elapsed_str}"})
+                self._put({"type": "pp_end"})
                 self._current_pp = None
                 self._pp_start = None
-            self.status.empty()
 
     def notify(self, msg: str) -> None:
-        self.bar.progress(0.0)  # reset bar for new download phase
-        self.status.markdown(msg)
+        self._put({"type": "progress", "bar": 0.0, "status": msg})
+
+    def reset_phase(self) -> None:
+        # Chamado entre passes de download (ex: vídeo → legendas separadas)
+        # para evitar que timers/labels do passe anterior vazem no próximo.
+        self._dl_start = None
+        self._current_pp = None
+        self._pp_start = None
+        self._put({"type": "pp_end"})
 
 
-def _run_download(urls: list[str], opts_without_hook: dict,
-                  display_container: Any) -> tuple[int, str | None]:
-    """Executa o download com barra de progresso. Retorna (retcode, erro)."""
-    progress = StreamlitProgress(display_container)
-
+def _download_worker(urls: list[str], opts: dict,
+                     q: queue.Queue, cancel: threading.Event) -> None:
+    """Runs in a background thread. Puts result dict into q when done."""
+    progress = _QueueProgress(q, cancel)
     _ydl_errors: list[str] = []
 
     class _Logger:
@@ -414,19 +518,35 @@ def _run_download(urls: list[str], opts_without_hook: dict,
         def error(self, msg: str) -> None:
             _ydl_errors.append(_ANSI_RE.sub("", msg))
 
-    opts = {
-        **opts_without_hook,
+    output_dir_str = opts.pop("_output_dir", "")
+    output_dir = Path(output_dir_str) if output_dir_str else None
+    full_opts = {
+        **opts,
         "progress_hooks": [progress.hook],
         "postprocessor_hooks": [progress.postprocessor_hook],
         "_notify": progress.notify,
+        "_reset_phase": progress.reset_phase,
         "logger": _Logger(),
     }
     try:
-        rc = core.download(urls, opts)
+        rc = core.download(urls, full_opts)
         err = _ydl_errors[-1] if _ydl_errors and rc != 0 else None
-        return rc, err
+    except SystemExit:
+        # Raised by progress hook when cancel event is set
+        if output_dir:
+            _cleanup_partial_files(output_dir)
+        q.put_nowait({"type": "done", "rc": -1, "err": None, "cancelled": True})
+        return
     except Exception as e:
-        return 1, _ANSI_RE.sub("", str(e))
+        # If cancel was triggered (e.g. ffmpeg killed mid-postprocess), yt-dlp
+        # surfaces a PostProcessingError here — treat it as a user cancellation.
+        if cancel.is_set():
+            if output_dir:
+                _cleanup_partial_files(output_dir)
+            q.put_nowait({"type": "done", "rc": -1, "err": None, "cancelled": True})
+            return
+        rc, err = 1, _ANSI_RE.sub("", str(e))
+    q.put_nowait({"type": "done", "rc": rc, "err": err, "cancelled": False})
 
 
 # ================================================================
@@ -534,6 +654,7 @@ def render_download_options(key_prefix: str,
         audio_fmt = "mp3"
         audio_quality_val = "0"
         selected_sub_langs: list[str] = []
+        embed_subs: bool = False
 
         if mode in ("Vídeo + áudio", "Apenas vídeo"):
             st.markdown("**🎞️ Vídeo**")
@@ -649,6 +770,17 @@ def render_download_options(key_prefix: str,
 
                     if not selected_sub_langs:
                         st.warning("Selecione ao menos um idioma de legenda.")
+
+                    if want_subs and mode in ("Vídeo + áudio", "Apenas vídeo"):
+                        embed_subs = st.checkbox(
+                            "Embutir legendas no vídeo",
+                            value=False,
+                            key=f"{key_prefix}_embed_subs",
+                            help=(
+                                "Mais lento — ffmpeg re-multiplexa o vídeo no final. "
+                                "Quando desmarcado, o `.srt` é salvo ao lado do vídeo."
+                            ),
+                        )
             else:
                 want_subs = st.checkbox(
                     "Baixar legendas",
@@ -660,6 +792,17 @@ def render_download_options(key_prefix: str,
                     st.info("Nenhuma legenda encontrada para este vídeo. "
                             "Serão buscadas pt, pt-BR e en automaticamente.")
                     selected_sub_langs = ["pt", "pt-BR", "en"]
+
+                    if want_subs and mode in ("Vídeo + áudio", "Apenas vídeo"):
+                        embed_subs = st.checkbox(
+                            "Embutir legendas no vídeo",
+                            value=False,
+                            key=f"{key_prefix}_embed_subs",
+                            help=(
+                                "Mais lento — ffmpeg re-multiplexa o vídeo no final. "
+                                "Quando desmarcado, o `.srt` é salvo ao lado do vídeo."
+                            ),
+                        )
 
     # ---- Coluna B: cortes & extras ----
     with col_b:
@@ -709,9 +852,13 @@ def render_download_options(key_prefix: str,
             if mode not in ("Apenas áudio", "Apenas legendas"):
                 keyframes = st.checkbox(
                     "Cortes precisos (re-encode)",
-                    value=True,
+                    value=False,
                     key=f"{key_prefix}_kf",
-                    help="Mais lento, mas o corte é exato no frame pedido.",
+                    help=(
+                        "Muito mais lento — baixa o vídeo inteiro e re-encoda via ffmpeg. "
+                        "Marque só se precisar de corte exato no frame pedido. "
+                        "Desmarcado: ffmpeg baixa direto o intervalo (mais rápido)."
+                    ),
                 )
             else:
                 keyframes = False
@@ -742,6 +889,7 @@ def render_download_options(key_prefix: str,
     result: dict[str, Any] = {
         "format_spec": format_spec,
         "merge_format": container,
+        "video_only": (mode == "Apenas vídeo"),
         "audio_only": audio_only,
         "audio_format": audio_fmt,
         "audio_quality": audio_quality_val,
@@ -751,6 +899,7 @@ def render_download_options(key_prefix: str,
         "embed_thumbnail": embed_thumb,
         "write_subtitles": has_subs or subtitles_only,
         "subtitles_only": subtitles_only,
+        "embed_subtitles": embed_subs,
         "_trim_error": trim_error,
     }
     if selected_sub_langs:
@@ -828,10 +977,11 @@ def tab_single() -> None:
         info=info,
     )
 
-    if st.button("⬇️  Baixar", type="primary", key="single_download",
-                 disabled=st.session_state.is_downloading):
-        _dispatch_download([info.get("webpage_url") or url.strip()],
-                           opts_kwargs, playlist=False)
+    if st.button("⬇️  Baixar", type="primary", key="single_download"):
+        _dispatch_download(
+            [info.get("webpage_url") or url.strip()],
+            opts_kwargs, playlist=False, infos=[info],
+        )
 
 
 # ================================================================
@@ -886,10 +1036,9 @@ def tab_multi() -> None:
             info=infos[0] if infos else None,
         )
 
-        if st.button("⬇️  Baixar todos", type="primary", key="multi_download",
-                     disabled=st.session_state.is_downloading):
+        if st.button("⬇️  Baixar todos", type="primary", key="multi_download"):
             urls_to_dl = [i.get("webpage_url") for i in infos if i.get("webpage_url")]
-            _dispatch_download(urls_to_dl, opts_kwargs, playlist=False)
+            _dispatch_download(urls_to_dl, opts_kwargs, playlist=False, infos=infos)
     else:
         st.info("Cole URLs acima e clique em **Analisar todos**.")
 
@@ -964,15 +1113,14 @@ def tab_playlist() -> None:
 
     if st.button(f"⬇️  Baixar {len(selected_indices)} selecionado(s)",
                  type="primary", key="pl_download",
-                 disabled=(not selected_indices or
-                           st.session_state.is_downloading)):
-        # Converte lista de ints para spec do yt-dlp ("1,3,5-7")
+                 disabled=not selected_indices):
         items_spec = _ints_to_spec(selected_indices)
         opts_kwargs["playlist_items"] = items_spec
         _dispatch_download(
             [info.get("webpage_url") or pl_url.strip()],
             opts_kwargs,
             playlist=True,
+            infos=None,
         )
 
 
@@ -998,8 +1146,14 @@ def _ints_to_spec(ints: list[int]) -> str:
 # ================================================================
 
 def _dispatch_download(urls: list[str], opts_kwargs: dict,
-                       playlist: bool) -> None:
-    # Validação de pasta de saída
+                       playlist: bool,
+                       infos: list[dict] | None = None) -> None:
+    """Validate, optionally confirm, then start download."""
+    trim_error = opts_kwargs.pop("_trim_error", False)
+    if trim_error:
+        st.error("❌ Corrija os tempos de corte antes de baixar.")
+        return
+
     output_dir = st.session_state["output_dir"].strip()
     if not output_dir:
         st.error("❌ Pasta de saída não pode ser vazia.")
@@ -1011,60 +1165,281 @@ def _dispatch_download(urls: list[str], opts_kwargs: dict,
         st.error(f"❌ Pasta de saída inválida: {e}")
         return
 
-    # Remove flag interna de trim error
-    trim_error = opts_kwargs.pop("_trim_error", False)
-    if trim_error:
-        st.error("❌ Corrija os tempos de corte antes de baixar.")
+    # Download already running → ask for confirmation instead of starting immediately
+    if st.session_state.dl_state in ("running", "cancelling"):
+        st.session_state.dl_confirm_pending = {
+            "urls": urls,
+            "opts_kwargs": opts_kwargs,
+            "playlist": playlist,
+            "infos": infos,
+            "output_path": str(output_path),
+        }
+        st.rerun()
         return
 
+    _start_download(urls, opts_kwargs, playlist, infos, output_path)
+
+
+def _start_download(urls: list[str], opts_kwargs: dict,
+                    playlist: bool,
+                    infos: list[dict] | None,
+                    output_path: Path | str) -> None:
+    """Launch the background download thread and update session state."""
+    output_path = Path(output_path)
+    st.session_state.dl_confirm_pending = None
+
     cookies = _cookies_config()
+    duration = None
+    if infos:
+        duration = (infos[0] or {}).get("duration")
     opts = core.build_options(
         output_dir=output_path,
         playlist=playlist,
         cookies_browser=cookies["cookies_browser"],
         cookies_file=cookies["cookies_file"],
         quiet=True,
+        duration=duration,
         **opts_kwargs,
     )
 
-    st.session_state.is_downloading = True
-    display_area = st.container(border=True)
-    display_area.markdown("### ⏳ Baixando...")
-    progress_slot = display_area.container()
+    # Se o arquivo destino já existe, nomear o NOVO download com ' (N)' ao
+    # invés de renomear os antigos. Apenas para vídeo único: em playlists
+    # cada item tem ID único, raramente colide.
+    if infos and len(infos) == 1 and not playlist:
+        info = infos[0] or {}
+        try:
+            with yt_dlp.YoutubeDL({"outtmpl": opts["outtmpl"],
+                                   "windowsfilenames": True,
+                                   "quiet": True}) as _probe:
+                expected = Path(_probe.prepare_filename(info))
+            inc_suffix = _next_available_suffix(expected)
+            if inc_suffix:
+                opts["outtmpl"] = opts["outtmpl"].replace(
+                    ".%(ext)s", f"{inc_suffix}.%(ext)s"
+                )
+        except Exception:
+            # prepare_filename pode falhar em info parcial; segue sem sufixo
+            pass
+    # Stash clean output_dir for the worker — the outtmpl may contain '/' inside
+    # variable expressions (e.g. playlist_title) that confuse Path().parent.
+    opts["_output_dir"] = str(output_path)
 
-    _t0 = time.monotonic()
-    try:
-        rc, err = _run_download(urls, opts, progress_slot)
-    except Exception as e:
-        rc, err = 1, str(e)
-    finally:
-        st.session_state.is_downloading = False
+    q: queue.Queue = queue.Queue()
+    cancel = threading.Event()
+    t = threading.Thread(target=_download_worker, args=(urls, opts, q, cancel),
+                         daemon=True)
 
-    total_elapsed = _fmt_elapsed(time.monotonic() - _t0)
-    if rc == 0:
-        display_area.success(
-            f"✅ Download concluído em: `{st.session_state['output_dir']}` "
-            f"— ⏱ tempo total: **{total_elapsed}**"
-        )
-        st.balloons()
-    else:
-        err_msg = err or f"retcode={rc}"
-        display_area.error(f"❌ Falhou após {total_elapsed}: {err_msg}")
-        _is_file_lock = any(k in (err_msg or "") for k in
-                            ("WinError 32", "sendo usado", "being used by another process",
-                             "Unable to rename"))
-        if _is_file_lock:
-            display_area.warning(
-                "🛡️ **Windows Defender / Indexação** está bloqueando a renomeação do arquivo.\n\n"
-                "**Solução permanente:** adicione a pasta de downloads às exclusões do Defender:\n"
-                "Segurança do Windows → Proteção contra vírus e ameaças → "
-                "Configurações de proteção → Exclusões → Adicionar pasta."
+    st.session_state.dl_state = "running"
+    st.session_state.dl_queue = q
+    st.session_state.dl_cancel = cancel
+    st.session_state.dl_thread = t
+    st.session_state.dl_log = []
+    st.session_state.dl_bar = 0.0
+    st.session_state.dl_status = "⏳ Iniciando..."
+    st.session_state.dl_t0 = time.monotonic()
+    st.session_state.dl_err = None
+    st.session_state.dl_output_dir = str(output_path)
+    st.session_state.dl_balloons_shown = False
+    st.session_state.dl_pp_label = None
+    st.session_state.dl_pp_start = None
+
+    t.start()
+    st.rerun()
+
+
+# ================================================================
+# Download section (persistent across tab switches)
+# ================================================================
+
+def _drain_queue() -> None:
+    """Drain all pending messages from the download queue into session state."""
+    q: queue.Queue = st.session_state.dl_queue
+    if q is None:
+        return
+    while True:
+        try:
+            msg = q.get_nowait()
+        except queue.Empty:
+            break
+        if msg["type"] == "progress":
+            new_bar = msg.get("bar")
+            if new_bar is not None:
+                st.session_state.dl_bar = new_bar
+            new_status = msg.get("status")
+            if new_status:  # only overwrite with non-empty status
+                st.session_state.dl_status = new_status
+        elif msg["type"] == "pp_start":
+            st.session_state.dl_pp_label = msg["label"]
+            st.session_state.dl_pp_start = msg["start"]
+            st.session_state.dl_bar = 1.0
+        elif msg["type"] == "pp_end":
+            st.session_state.dl_pp_label = None
+            st.session_state.dl_pp_start = None
+        elif msg["type"] == "log":
+            st.session_state.dl_log.append(msg["msg"])
+        elif msg["type"] == "done":
+            elapsed = _fmt_elapsed(time.monotonic() - st.session_state.dl_t0)
+            if msg.get("cancelled"):
+                st.session_state.dl_state = "cancelled"
+            elif msg["rc"] == 0:
+                st.session_state.dl_state = "done"
+            else:
+                st.session_state.dl_state = "error"
+                st.session_state.dl_err = msg.get("err") or f"retcode={msg['rc']}"
+            st.session_state.dl_status = elapsed
+            break
+
+
+def render_download_section() -> None:
+    state = st.session_state.dl_state
+    confirm = st.session_state.dl_confirm_pending
+
+    # Cancelled → show toast once and return to idle; no close button panel.
+    if state == "cancelled":
+        st.toast("🛑 Download cancelado.", icon="⚠️")
+        st.session_state.dl_state = "idle"
+        st.session_state.dl_log = []
+        st.session_state.dl_status = ""
+        st.session_state.dl_bar = 0.0
+        st.session_state.dl_pp_label = None
+        st.session_state.dl_pp_start = None
+        st.rerun()
+        return
+
+    if state == "idle" and not confirm:
+        return
+
+    with st.container(border=True):
+
+        # ---- Confirmation dialog (new download requested while one is running) ----
+        # Returns immediately after rendering so the running panel below is hidden
+        # while the user is choosing — otherwise two panels describe the same download.
+        if confirm:
+            st.warning(
+                "⚠️ Já existe um download em andamento. "
+                "Iniciar o novo vai cancelar o atual."
             )
-        else:
-            display_area.info(
-                "Cheque se o Deno está instalado, se os cookies do Firefox "
-                "estão válidos (refaça o ritual) e se o yt-dlp está atualizado."
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Sim, cancelar e baixar novo", type="primary",
+                             key="dl_confirm_yes"):
+                    if st.session_state.dl_cancel:
+                        st.session_state.dl_cancel.set()
+                    _kill_ffmpeg_children()
+                    pending = st.session_state.dl_confirm_pending
+                    st.session_state.dl_confirm_pending = None
+                    st.session_state.dl_state = "idle"  # let _start_download proceed
+                    _start_download(
+                        pending["urls"], pending["opts_kwargs"],
+                        pending["playlist"], pending.get("infos"),
+                        Path(pending["output_path"]),
+                    )
+            with c2:
+                if st.button("❌ Não, manter download atual", key="dl_confirm_no"):
+                    st.session_state.dl_confirm_pending = None
+                    st.rerun()
+            return
+
+        # ---- Drain queue for active states ----
+        if state in ("running", "cancelling"):
+            _drain_queue()
+            # Fallback: if thread died without sending done (e.g. SystemExit propagated)
+            thread = st.session_state.dl_thread
+            if st.session_state.dl_state == "cancelling" and thread and not thread.is_alive():
+                st.session_state.dl_state = "cancelled"
+                st.rerun()
+                return
+
+        current_state = st.session_state.dl_state
+
+        # Cancelled may be set by _drain_queue above; bounce out to the toast path.
+        if current_state == "cancelled":
+            st.rerun()
+            return
+
+        elapsed_total = _fmt_elapsed(time.monotonic() - st.session_state.dl_t0)
+
+        # ---- Terminal states (show result then let user close) ----
+        if current_state == "done":
+            st.success(
+                f"✅ Download concluído em: `{st.session_state.dl_output_dir}` "
+                f"— ⏱ tempo total: **{st.session_state.dl_status}**"
             )
+            if st.session_state.dl_log:
+                with st.expander("📋 Etapas concluídas", expanded=True):
+                    st.markdown("\n\n".join(st.session_state.dl_log))
+            # Balloons only on the first render after completion — otherwise any
+            # widget interaction (mode change, checkbox) reruns this block and
+            # re-fires the animation.
+            if not st.session_state.dl_balloons_shown:
+                st.balloons()
+                st.session_state.dl_balloons_shown = True
+            if st.button("Fechar", key="dl_close_done"):
+                st.session_state.dl_state = "idle"
+                st.rerun()
+            return
+
+        if current_state == "error":
+            err_msg = st.session_state.dl_err or "erro desconhecido"
+            st.error(f"❌ Falhou após {st.session_state.dl_status}: {err_msg}")
+            _is_file_lock = any(k in err_msg for k in
+                                ("WinError 32", "sendo usado",
+                                 "being used by another process", "Unable to rename"))
+            if _is_file_lock:
+                st.warning(
+                    "🛡️ **Windows Defender / Indexação** está bloqueando a renomeação do arquivo.\n\n"
+                    "Adicione a pasta de downloads às exclusões do Defender:\n"
+                    "Segurança do Windows → Proteção contra vírus → Exclusões → Adicionar pasta."
+                )
+            else:
+                st.info(
+                    "Cheque se o Deno está instalado, se os cookies do Firefox "
+                    "estão válidos (refaça o ritual) e se o yt-dlp está atualizado."
+                )
+            if st.session_state.dl_log:
+                with st.expander("📋 Log do download", expanded=True):
+                    st.markdown("\n\n".join(st.session_state.dl_log))
+            if st.button("Fechar", key="dl_close_error"):
+                st.session_state.dl_state = "idle"
+                st.rerun()
+            return
+
+        # ---- Active states: running / cancelling ----
+        if current_state == "running":
+            col_title, col_cancel = st.columns([5, 1])
+            with col_title:
+                st.markdown("### ⏳ Baixando...")
+            with col_cancel:
+                st.write("")
+                if st.button("🛑 Cancelar", key="dl_cancel_btn", type="secondary"):
+                    st.session_state.dl_cancel.set()
+                    st.session_state.dl_state = "cancelling"
+                    _kill_ffmpeg_children()
+                    st.rerun()
+        else:  # cancelling
+            st.markdown("### ⏸ Cancelando...")
+            st.caption("Aguardando a interrupção do download...")
+
+        bar_val = min(max(float(st.session_state.dl_bar), 0.0), 1.0)
+        st.progress(bar_val)
+
+        # Live status text: during a postprocessor run, show label + elapsed.
+        # Outside of it, show whatever the download hook last pushed (download
+        # progress text with ETA/speed, or the "Processando com ffmpeg…" placeholder).
+        pp_label = st.session_state.dl_pp_label
+        pp_start = st.session_state.dl_pp_start
+        if pp_label and pp_start is not None:
+            pp_elapsed = _fmt_elapsed(time.monotonic() - pp_start)
+            st.markdown(f"⚙️ **{pp_label}…** — ⏱ {pp_elapsed}")
+        elif st.session_state.dl_status:
+            st.markdown(st.session_state.dl_status)
+
+        if st.session_state.dl_log:
+            st.markdown("\n\n".join(st.session_state.dl_log[-12:]))
+        st.caption(f"⏱ Tempo decorrido: {elapsed_total}")
+
+        time.sleep(0.3)
+        st.rerun()
 
 
 # ================================================================
@@ -1080,7 +1455,6 @@ def main() -> None:
         "qualidade, formato e cortes. Use o **Firefox logado** no YouTube."
     )
 
-    # Aviso crítico no topo se faltar Deno
     if not core.check_deno():
         st.error(
             "🚨 **Deno não encontrado.** Sem ele, o YouTube só libera "
@@ -1100,6 +1474,10 @@ def main() -> None:
         tab_multi()
     with tab3:
         tab_playlist()
+
+    # Rendered AFTER tabs so st.rerun() inside doesn't block tab content from rendering
+    st.divider()
+    render_download_section()
 
 
 if __name__ == "__main__":

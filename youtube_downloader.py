@@ -125,6 +125,16 @@ def parse_time_to_seconds(s: str | int | float) -> float:
     return total
 
 
+def _format_hms_dash(seconds: float | int | None) -> str:
+    # Hífen em vez de ':' porque ':' é inválido em nomes de arquivo no Windows.
+    if seconds is None or seconds < 0:
+        return "00-00-00"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}-{m:02d}-{sec:02d}"
+
+
 def format_duration(seconds: float | int | None) -> str:
     if seconds is None or seconds < 0:
         return "?"
@@ -324,6 +334,7 @@ def build_options(
     *,
     format_spec: str = "bestvideo*+bestaudio/best",
     merge_format: str = "mp4",
+    video_only: bool = False,
     audio_only: bool = False,
     audio_format: str = "mp3",
     audio_quality: str = "0",  # 0 (best) ... 9 (worst) — ffmpeg VBR
@@ -334,9 +345,11 @@ def build_options(
     trim_start: Optional[float] = None,
     trim_end: Optional[float] = None,
     force_keyframes_at_cuts: bool = True,
+    duration: Optional[float] = None,
     write_subtitles: bool = False,
     subtitles_only: bool = False,
     subtitles_langs: Optional[list[str]] = None,
+    embed_subtitles: bool = False,
     embed_thumbnail: bool = False,
     embed_metadata: bool = True,
     progress_hook: Optional[Callable[[dict], None]] = None,
@@ -351,14 +364,37 @@ def build_options(
 
     opts: dict[str, Any] = {**BASE_OPTS, "quiet": quiet, "verbose": verbose}
     opts["noplaylist"] = not playlist
-    opts["overwrites"] = True  # sempre sobrescreve para evitar skip silencioso quando arquivo já existe
+    opts["overwrites"] = False  # auto-increment handled by app before download
+
+    # Sufixo de trim no nome (calculado aqui para entrar no outtmpl).
+    # O sufixo permanece mesmo quando o trim acaba sendo pulado por cobrir
+    # toda a duração — o usuário marcou a opção, então o nome reflete isso.
+    has_trim = trim_start is not None or trim_end is not None
+    trim_covers_full = False
+    trim_suffix = ""
+    if has_trim:
+        start_s = float(trim_start) if trim_start is not None else 0.0
+        if trim_end is not None:
+            end_s: Optional[float] = float(trim_end)
+        elif duration is not None:
+            end_s = float(duration)
+        else:
+            end_s = None
+        if end_s is not None:
+            trim_suffix = (
+                f" ({_format_hms_dash(start_s)} - {_format_hms_dash(end_s)})"
+            )
+        else:
+            trim_suffix = f" ({_format_hms_dash(start_s)} - fim)"
+        if duration is not None and end_s is not None:
+            trim_covers_full = (start_s <= 1.0 and (float(duration) - end_s) <= 1.0)
 
     # Template de nome de arquivo
     if outtmpl is None:
         if playlist:
-            outtmpl = "%(playlist_title&{}/|)s%(title).180B [%(id)s].%(ext)s"
+            outtmpl = f"%(playlist_title&{{}}/|)s%(title).180B [%(id)s]{trim_suffix}.%(ext)s"
         else:
-            outtmpl = "%(title).200B [%(id)s].%(ext)s"
+            outtmpl = f"%(title).200B [%(id)s]{trim_suffix}.%(ext)s"
     opts["outtmpl"] = str(output_dir / outtmpl)
 
     # Format
@@ -372,6 +408,9 @@ def build_options(
             "preferredcodec": audio_format,
             "preferredquality": audio_quality,
         })
+    elif video_only:
+        opts["format"] = format_spec
+        opts["remux_video"] = merge_format  # remux single stream (no merge)
     else:
         opts["format"] = format_spec
         opts["merge_output_format"] = merge_format
@@ -405,20 +444,25 @@ def build_options(
     # Quando há trim + legendas juntos, yt-dlp pode corromper o vídeo.
     # Solução: separar em dois passes — vídeo trimado sem legendas,
     # depois legendas baixadas à parte e trimadas por nós.
-    has_trim = trim_start is not None or trim_end is not None
-    _need_separate_subs = (write_subtitles and has_trim and not subtitles_only)
+    # Se o trim cobre o vídeo todo, tratamos como sem-trim para evitar
+    # re-encode e dois-passes desnecessários.
+    trim_active = has_trim and not trim_covers_full
+    _need_separate_subs = (write_subtitles and trim_active and not subtitles_only)
 
     if (write_subtitles or subtitles_only) and not _need_separate_subs:
         opts["writesubtitles"] = True
         opts["writeautomaticsub"] = True
         opts["subtitleslangs"] = _subs_langs
         opts["subtitlesformat"] = "best"
+        # FFmpegEmbedSubtitle apaga o .srt após embutir; keepsubs mantém o
+        # arquivo na pasta para que o usuário tenha os dois (separado + embutido).
+        opts["keepsubs"] = True
         postprocessors.append({
             "key": "FFmpegSubtitlesConvertor",
             "format": "srt",
         })
-        # Embutir legendas no container (somente quando há vídeo)
-        if not audio_only and not subtitles_only:
+        # Embutir legendas no container (opt-in pelo usuário)
+        if embed_subtitles and not audio_only and not subtitles_only:
             postprocessors.append({
                 "key": "FFmpegEmbedSubtitle",
             })
@@ -433,15 +477,25 @@ def build_options(
     if playlist_items:
         opts["playlist_items"] = playlist_items
 
-    # Cortes (trim)
-    if has_trim:
+    # Cortes (trim) — só aplica se trim_active (não coberto pela duração total)
+    if trim_active:
         start = float(trim_start) if trim_start is not None else 0.0
         end = float(trim_end) if trim_end is not None else None
         if not subtitles_only:
-            # end=None → yt-dlp interpreta como até o fim
-            ranges = [(start, end if end is not None else float("inf"))]
-            opts["download_ranges"] = download_range_func(None, ranges)
-            opts["force_keyframes_at_cuts"] = force_keyframes_at_cuts
+            if force_keyframes_at_cuts:
+                # Frame-accurate: precisa de download_ranges + re-encode via PP.
+                # end=None → yt-dlp interpreta como até o fim
+                ranges = [(start, end if end is not None else float("inf"))]
+                opts["download_ranges"] = download_range_func(None, ranges)
+                opts["force_keyframes_at_cuts"] = True
+            else:
+                # Fast path: ffmpeg baixa só o intervalo via -ss/-to nativo.
+                # Evita o "baixa completo e corta depois" do download_ranges+DASH.
+                opts["external_downloader"] = "ffmpeg"
+                ff_args = ["-ss", f"{start:.3f}"]
+                if end is not None:
+                    ff_args += ["-to", f"{end:.3f}"]
+                opts["external_downloader_args"] = {"ffmpeg_i": ff_args}
         # Marca legendas para trimming pós-download
         if write_subtitles or subtitles_only:
             opts["_subtitle_trim"] = {
@@ -454,8 +508,8 @@ def build_options(
         opts["_separate_subs"] = {
             "langs": _subs_langs,
         }
-        # Embutir legendas no container após o trimming
-        if not audio_only:
+        # Embutir legendas no container após o trimming (opt-in)
+        if embed_subtitles and not audio_only:
             opts["_embed_subs"] = True
 
     if postprocessors:
@@ -579,6 +633,7 @@ def download(urls: Iterable[str], opts: dict) -> int:
     separate_subs = opts.pop("_separate_subs", None)
     embed_subs = opts.pop("_embed_subs", False)
     notify = opts.pop("_notify", None)  # Optional[Callable[[str], None]]
+    reset_phase = opts.pop("_reset_phase", None)  # Optional[Callable[[], None]]
 
     # Rastreia legendas existentes para trimming/embedding posterior
     outtmpl = opts.get("outtmpl", "%(title)s.%(ext)s")
@@ -587,12 +642,21 @@ def download(urls: Iterable[str], opts: dict) -> int:
     if (subtitle_trim or embed_subs) and output_dir.exists():
         pre_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
 
+    # Só emite notify especial no caminho de re-encode (force_keyframes), onde
+    # a fase ffmpeg é silenciosa. No fast-path com external_downloader=ffmpeg,
+    # os progress_hooks do yt-dlp parseiam a saída do ffmpeg e exibem ETA/bytes
+    # normalmente — deixar eles dirigirem a UI.
+    if opts.get("force_keyframes_at_cuts") and notify:
+        notify("✂️ Trim com re-encode — corte frame-accurate (pode demorar)")
+
     # ---- Passo 1: download principal (vídeo/áudio, SEM legendas se trim ativo) ----
     with yt_dlp.YoutubeDL(opts) as ydl:
         rc = ydl.download(urls)
 
     # ---- Passo 2: legendas separadas (quando trim + legendas juntos) ----
     if separate_subs is not None:
+        if reset_phase:
+            reset_phase()
         if notify:
             notify("⬇️ Baixando legendas…")
         subs_opts = {**BASE_OPTS, "quiet": opts.get("quiet", True)}
