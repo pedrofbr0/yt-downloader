@@ -85,15 +85,22 @@ _init_state()
 # Helpers
 # ================================================================
 
-def _next_available_suffix(expected: Path) -> str:
-    """'' se expected livre; ' (N)' com próximo N livre caso contrário.
+def _next_available_suffix(expected_stem: Path, final_ext: str) -> str:
+    """'' se o arquivo final livre; ' (N)' com próximo N livre caso contrário.
+
+    Checa contra a extensão REAL do arquivo pós-merge/remux/extract, não a
+    do stream de origem (prepare_filename devolve ``.webm``/``.m4a`` do
+    DASH, mas o arquivo final é ``.mp4``/``.mp3`` conforme o modo).
 
     Usado para nomear o NOVO download com (N) em vez de renomear os antigos.
     """
-    if not expected.exists():
+    base_path = expected_stem.with_suffix(f".{final_ext}")
+    if not base_path.exists():
         return ""
     n = 1
-    while expected.with_name(f"{expected.stem} ({n}){expected.suffix}").exists():
+    while expected_stem.with_name(
+        f"{expected_stem.name} ({n}).{final_ext}"
+    ).exists():
         n += 1
     return f" ({n})"
 
@@ -1207,19 +1214,32 @@ def _start_download(urls: list[str], opts_kwargs: dict,
     # cada item tem ID único, raramente colide.
     if infos and len(infos) == 1 and not playlist:
         info = infos[0] or {}
-        try:
-            with yt_dlp.YoutubeDL({"outtmpl": opts["outtmpl"],
-                                   "windowsfilenames": True,
-                                   "quiet": True}) as _probe:
-                expected = Path(_probe.prepare_filename(info))
-            inc_suffix = _next_available_suffix(expected)
-            if inc_suffix:
-                opts["outtmpl"] = opts["outtmpl"].replace(
-                    ".%(ext)s", f"{inc_suffix}.%(ext)s"
-                )
-        except Exception:
-            # prepare_filename pode falhar em info parcial; segue sem sufixo
-            pass
+        # Extensão FINAL (pós-merge/remux/extract) determina se houve colisão:
+        #   audio_only      → audio_format (mp3, m4a, ...)
+        #   subtitles_only  → None (arquivos .lang.srt — colisão atípica)
+        #   video_only/v+a  → merge_format (via remux_video ou merge_output_format)
+        if opts_kwargs.get("subtitles_only"):
+            final_ext = None
+        elif opts_kwargs.get("audio_only"):
+            final_ext = opts_kwargs.get("audio_format", "mp3")
+        else:
+            final_ext = opts_kwargs.get("merge_format", "mp4")
+
+        if final_ext:
+            try:
+                with yt_dlp.YoutubeDL({"outtmpl": opts["outtmpl"],
+                                       "windowsfilenames": True,
+                                       "quiet": True}) as _probe:
+                    expected_full = Path(_probe.prepare_filename(info))
+                expected_stem = expected_full.with_suffix("")
+                inc_suffix = _next_available_suffix(expected_stem, final_ext)
+                if inc_suffix:
+                    opts["outtmpl"] = opts["outtmpl"].replace(
+                        ".%(ext)s", f"{inc_suffix}.%(ext)s"
+                    )
+            except Exception:
+                # prepare_filename pode falhar em info parcial; segue sem sufixo
+                pass
     # Stash clean output_dir for the worker — the outtmpl may contain '/' inside
     # variable expressions (e.g. playlist_title) that confuse Path().parent.
     opts["_output_dir"] = str(output_path)

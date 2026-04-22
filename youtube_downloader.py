@@ -482,20 +482,12 @@ def build_options(
         start = float(trim_start) if trim_start is not None else 0.0
         end = float(trim_end) if trim_end is not None else None
         if not subtitles_only:
-            if force_keyframes_at_cuts:
-                # Frame-accurate: precisa de download_ranges + re-encode via PP.
-                # end=None → yt-dlp interpreta como até o fim
-                ranges = [(start, end if end is not None else float("inf"))]
-                opts["download_ranges"] = download_range_func(None, ranges)
-                opts["force_keyframes_at_cuts"] = True
-            else:
-                # Fast path: ffmpeg baixa só o intervalo via -ss/-to nativo.
-                # Evita o "baixa completo e corta depois" do download_ranges+DASH.
-                opts["external_downloader"] = "ffmpeg"
-                ff_args = ["-ss", f"{start:.3f}"]
-                if end is not None:
-                    ff_args += ["-to", f"{end:.3f}"]
-                opts["external_downloader_args"] = {"ffmpeg_i": ff_args}
+            # external_downloader=ffmpeg com -ss/-to trava em DASH do YouTube
+            # (android_vr/SABR exige o downloader de fragmentos nativo do yt-dlp).
+            # Sempre usar download_ranges; só alternar keyframes vs. re-encode.
+            ranges = [(start, end if end is not None else float("inf"))]
+            opts["download_ranges"] = download_range_func(None, ranges)
+            opts["force_keyframes_at_cuts"] = bool(force_keyframes_at_cuts)
         # Marca legendas para trimming pós-download
         if write_subtitles or subtitles_only:
             opts["_subtitle_trim"] = {
@@ -642,12 +634,22 @@ def download(urls: Iterable[str], opts: dict) -> int:
     if (subtitle_trim or embed_subs) and output_dir.exists():
         pre_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
 
-    # Só emite notify especial no caminho de re-encode (force_keyframes), onde
-    # a fase ffmpeg é silenciosa. No fast-path com external_downloader=ffmpeg,
-    # os progress_hooks do yt-dlp parseiam a saída do ffmpeg e exibem ETA/bytes
-    # normalmente — deixar eles dirigirem a UI.
-    if opts.get("force_keyframes_at_cuts") and notify:
-        notify("✂️ Trim com re-encode — corte frame-accurate (pode demorar)")
+    # Mensagem inicial — o progress_hook só dispara depois que yt-dlp resolve
+    # a URL e baixa o primeiro fragmento; até lá o status ficaria em "Iniciando…".
+    if notify:
+        if opts.get("download_ranges"):
+            if opts.get("force_keyframes_at_cuts"):
+                notify(
+                    "✂️ Trim com re-encode — baixando o intervalo e "
+                    "re-codificando para corte frame-accurate (pode demorar)…"
+                )
+            else:
+                notify(
+                    "✂️ Trim rápido — baixando só o intervalo (corte no "
+                    "keyframe mais próximo)…"
+                )
+        else:
+            notify("🔗 Resolvendo URL do YouTube…")
 
     # ---- Passo 1: download principal (vídeo/áudio, SEM legendas se trim ativo) ----
     with yt_dlp.YoutubeDL(opts) as ydl:
