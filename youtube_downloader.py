@@ -22,11 +22,16 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 import yt_dlp
 from yt_dlp.utils import download_range_func
+from yt_dlp.postprocessor.ffmpeg import (
+    FFmpegPostProcessor, FFmpegPostProcessorError,
+)
 
 
 # ================================================================
@@ -453,18 +458,25 @@ def build_options(
         opts["writesubtitles"] = True
         opts["writeautomaticsub"] = True
         opts["subtitleslangs"] = _subs_langs
-        opts["subtitlesformat"] = "best"
-        # FFmpegEmbedSubtitle apaga o .srt após embutir; keepsubs mantém o
-        # arquivo na pasta para que o usuário tenha os dois (separado + embutido).
-        opts["keepsubs"] = True
+        # YouTube lista json3 por último; "best" pegava json3, que o convertor
+        # se recusa a transformar em srt. "srt/vtt/best" prefere srt nativo,
+        # cai para vtt (convertível) e só por último aceita qualquer formato.
+        opts["subtitlesformat"] = "srt/vtt/best"
         postprocessors.append({
+            # when='before_dl' garante que o convertor rode entre o download
+            # da legenda e do vídeo, antes do MoveFilesAfterDownloadPP — caso
+            # contrário a referência em __files_to_move pode ficar incorreta.
             "key": "FFmpegSubtitlesConvertor",
             "format": "srt",
+            "when": "before_dl",
         })
         # Embutir legendas no container (opt-in pelo usuário)
         if embed_subtitles and not audio_only and not subtitles_only:
             postprocessors.append({
                 "key": "FFmpegEmbedSubtitle",
+                # já temos as legendas em arquivo separado: não apagar após
+                # embutir, para o usuário manter ambas as cópias.
+                "already_have_subtitle": True,
             })
 
     # Cookies
@@ -611,6 +623,141 @@ def _embed_subs_in_video(srt_files: Iterable[Path]) -> None:
 
 
 # ================================================================
+# Progresso ao vivo dos postprocessors ffmpeg
+# ================================================================
+#
+# yt-dlp roda os PPs ffmpeg via subprocess.Popen bloqueante: nenhum hook
+# emite progresso em tempo real. Para a UI mostrar bar/ETA durante merge,
+# trim re-encode, embed etc., monkey-patcheamos `real_run_ffmpeg`:
+#  - injeta `-progress pipe:1 -nostats` para o ffmpeg emitir métricas
+#  - lê stdout linha-a-linha em foreground (out_time_us=, progress=)
+#  - lê stderr em thread (parse de Duration: HH:MM:SS.mm + buffer p/ erros)
+#  - chama _PP_PROGRESS_CALLBACK(frac, elapsed_us, total_us)
+
+_PP_PROGRESS_CALLBACK: Optional[Callable[[float, int, int], None]] = None
+_FFPROGRESS_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
+
+
+def set_pp_progress_callback(fn: Optional[Callable[[float, int, int], None]]) -> None:
+    """Registra callback chamado durante PPs ffmpeg. Thread-safe (1 download/vez)."""
+    global _PP_PROGRESS_CALLBACK
+    _PP_PROGRESS_CALLBACK = fn
+
+
+_orig_real_run_ffmpeg = FFmpegPostProcessor.real_run_ffmpeg
+
+
+def _patched_real_run_ffmpeg(self, input_path_opts, output_path_opts,
+                             *, expected_retcodes=(0,)):
+    """Drop-in replacement de real_run_ffmpeg que emite progresso."""
+    # Sem callback configurado → fallback transparente para o original
+    if _PP_PROGRESS_CALLBACK is None:
+        return _orig_real_run_ffmpeg(
+            self, input_path_opts, output_path_opts,
+            expected_retcodes=expected_retcodes,
+        )
+
+    import itertools as _it
+    import os as _os
+
+    self.check_version()
+    oldest_mtime = min(
+        _os.stat(path).st_mtime for path, _ in input_path_opts if path)
+
+    cmd = [self.executable, "-y"]
+    if self.basename == "ffmpeg":
+        cmd += ["-loglevel", "repeat+info", "-progress", "pipe:1", "-nostats"]
+
+    def make_args(file, args, name, number):
+        keys = [f"_{name}{number}", f"_{name}"]
+        if name == "o":
+            args += ["-movflags", "+faststart"]
+            if number == 1:
+                keys.append("")
+        args += self._configuration_args(self.basename, keys)
+        if name == "i":
+            args.append("-i")
+        return [*args, self._ffmpeg_filename_argument(file)]
+
+    for arg_type, path_opts in (("i", input_path_opts), ("o", output_path_opts)):
+        cmd += list(_it.chain.from_iterable(
+            make_args(path, list(opts), arg_type, i + 1)
+            for i, (path, opts) in enumerate(path_opts) if path))
+
+    self.write_debug(f"ffmpeg command line: {cmd}")
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE, text=True, bufsize=1,
+    )
+
+    duration_us = {"value": 0}  # mutável p/ thread reader
+    stderr_buf: list[str] = []
+
+    def _read_stderr() -> None:
+        for line in proc.stderr:
+            stderr_buf.append(line)
+            if not duration_us["value"]:
+                m = _FFPROGRESS_DURATION_RE.search(line)
+                if m:
+                    h, mn, s = m.groups()
+                    duration_us["value"] = int(
+                        (int(h) * 3600 + int(mn) * 60 + float(s)) * 1_000_000
+                    )
+
+    t = threading.Thread(target=_read_stderr, daemon=True)
+    t.start()
+
+    last_emit = 0.0
+    last_out_us = 0
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line.startswith("out_time_us="):
+                continue
+            try:
+                cur_us = int(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            last_out_us = cur_us
+            now = time.monotonic()
+            # throttle a 4 Hz para não inundar a queue da UI
+            if now - last_emit < 0.25:
+                continue
+            last_emit = now
+            total = duration_us["value"]
+            frac = (cur_us / total) if total else 0.0
+            try:
+                _PP_PROGRESS_CALLBACK(min(frac, 1.0), cur_us, total)
+            except Exception:
+                pass
+    finally:
+        proc.wait()
+        t.join(timeout=2)
+
+    stderr = "".join(stderr_buf)
+    if proc.returncode not in (expected_retcodes if isinstance(expected_retcodes, tuple) else (expected_retcodes,)):
+        last = (stderr.strip().splitlines() or [""])[-1]
+        raise FFmpegPostProcessorError(last)
+
+    # Tick final em 100% para garantir bar cheia ao concluir
+    try:
+        _PP_PROGRESS_CALLBACK(1.0, last_out_us, duration_us["value"])
+    except Exception:
+        pass
+
+    for out_path, _ in output_path_opts:
+        if out_path:
+            self.try_utime(out_path, oldest_mtime, oldest_mtime)
+    return stderr
+
+
+# Aplica o patch uma única vez no import. Os PPs do yt-dlp todos chamam
+# real_run_ffmpeg via run_ffmpeg/run_ffmpeg_multiple_files.
+FFmpegPostProcessor.real_run_ffmpeg = _patched_real_run_ffmpeg
+
+
+# ================================================================
 # Download
 # ================================================================
 
@@ -666,12 +813,14 @@ def download(urls: Iterable[str], opts: dict) -> int:
         subs_opts["writesubtitles"] = True
         subs_opts["writeautomaticsub"] = True
         subs_opts["subtitleslangs"] = separate_subs["langs"]
-        subs_opts["subtitlesformat"] = "best"
+        # Mesma lógica do passo 1: prefere srt, fallback vtt → convertor pega.
+        subs_opts["subtitlesformat"] = "srt/vtt/best"
         subs_opts["outtmpl"] = outtmpl
         subs_opts["noplaylist"] = opts.get("noplaylist", True)
         subs_opts["postprocessors"] = [{
             "key": "FFmpegSubtitlesConvertor",
             "format": "srt",
+            "when": "before_dl",
         }]
         # Propagar hooks, cookies e logger do opts original
         for key in ("cookiefile", "cookiesfrombrowser", "playlist_items",

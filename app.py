@@ -72,6 +72,8 @@ def _init_state() -> None:
         "dl_balloons_shown": False,   # prevents balloons from re-firing on reruns
         "dl_pp_label": None,          # label of current postprocessor (for live elapsed)
         "dl_pp_start": None,          # monotonic timestamp when current PP started
+        "dl_pp_frac": 0.0,            # progress 0..1 of current ffmpeg PP
+        "dl_pp_eta": None,            # ETA string of current ffmpeg PP, or None
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -503,6 +505,20 @@ class _QueueProgress:
     def notify(self, msg: str) -> None:
         self._put({"type": "progress", "bar": 0.0, "status": msg})
 
+    def pp_progress(self, frac: float, elapsed_us: int, total_us: int) -> None:
+        # Chamado pelo monkey-patch de FFmpegPostProcessor.real_run_ffmpeg.
+        # Calcula ETA aproximada com base no progresso linear desde o início do PP.
+        eta_str: str | None = None
+        if self._pp_start and frac > 0.01:
+            run_elapsed = time.monotonic() - self._pp_start
+            remaining = run_elapsed * (1.0 - frac) / frac
+            eta_str = _fmt_elapsed(remaining)
+        self._put({
+            "type": "pp_progress",
+            "frac": min(max(frac, 0.0), 1.0),
+            "eta": eta_str,
+        })
+
     def reset_phase(self) -> None:
         # Chamado entre passes de download (ex: vídeo → legendas separadas)
         # para evitar que timers/labels do passe anterior vazem no próximo.
@@ -535,6 +551,9 @@ def _download_worker(urls: list[str], opts: dict,
         "_reset_phase": progress.reset_phase,
         "logger": _Logger(),
     }
+    # Registra callback que recebe progresso real do ffmpeg (parseado do
+    # `-progress pipe:1` injetado pelo monkey-patch em core.real_run_ffmpeg).
+    core.set_pp_progress_callback(progress.pp_progress)
     try:
         rc = core.download(urls, full_opts)
         err = _ydl_errors[-1] if _ydl_errors and rc != 0 else None
@@ -553,6 +572,8 @@ def _download_worker(urls: list[str], opts: dict,
             q.put_nowait({"type": "done", "rc": -1, "err": None, "cancelled": True})
             return
         rc, err = 1, _ANSI_RE.sub("", str(e))
+    finally:
+        core.set_pp_progress_callback(None)
     q.put_nowait({"type": "done", "rc": rc, "err": err, "cancelled": False})
 
 
@@ -1262,6 +1283,8 @@ def _start_download(urls: list[str], opts_kwargs: dict,
     st.session_state.dl_balloons_shown = False
     st.session_state.dl_pp_label = None
     st.session_state.dl_pp_start = None
+    st.session_state.dl_pp_frac = 0.0
+    st.session_state.dl_pp_eta = None
 
     t.start()
     st.rerun()
@@ -1291,10 +1314,18 @@ def _drain_queue() -> None:
         elif msg["type"] == "pp_start":
             st.session_state.dl_pp_label = msg["label"]
             st.session_state.dl_pp_start = msg["start"]
-            st.session_state.dl_bar = 1.0
+            st.session_state.dl_pp_frac = 0.0
+            st.session_state.dl_pp_eta = None
+            st.session_state.dl_bar = 0.0  # bar agora reflete o progresso do PP
+        elif msg["type"] == "pp_progress":
+            st.session_state.dl_pp_frac = msg.get("frac", 0.0)
+            st.session_state.dl_pp_eta = msg.get("eta")
+            st.session_state.dl_bar = st.session_state.dl_pp_frac
         elif msg["type"] == "pp_end":
             st.session_state.dl_pp_label = None
             st.session_state.dl_pp_start = None
+            st.session_state.dl_pp_frac = 0.0
+            st.session_state.dl_pp_eta = None
         elif msg["type"] == "log":
             st.session_state.dl_log.append(msg["msg"])
         elif msg["type"] == "done":
@@ -1443,14 +1474,23 @@ def render_download_section() -> None:
         bar_val = min(max(float(st.session_state.dl_bar), 0.0), 1.0)
         st.progress(bar_val)
 
-        # Live status text: during a postprocessor run, show label + elapsed.
-        # Outside of it, show whatever the download hook last pushed (download
-        # progress text with ETA/speed, or the "Processando com ffmpeg…" placeholder).
+        # Live status text: during a postprocessor run, show label + elapsed
+        # (+ ETA + % from real ffmpeg progress, when available). Outside of PPs,
+        # show whatever the download hook last pushed (download progress text
+        # with ETA/speed, or the "Processando com ffmpeg…" placeholder).
         pp_label = st.session_state.dl_pp_label
         pp_start = st.session_state.dl_pp_start
         if pp_label and pp_start is not None:
             pp_elapsed = _fmt_elapsed(time.monotonic() - pp_start)
-            st.markdown(f"⚙️ **{pp_label}…** — ⏱ {pp_elapsed}")
+            pp_frac = st.session_state.dl_pp_frac
+            pp_eta = st.session_state.dl_pp_eta
+            extras: list[str] = []
+            if pp_frac > 0:
+                extras.append(f"{pp_frac * 100:.0f}%")
+            if pp_eta:
+                extras.append(f"ETA {pp_eta}")
+            extras.append(f"⏱ {pp_elapsed}")
+            st.markdown(f"⚙️ **{pp_label}…** — {' • '.join(extras)}")
         elif st.session_state.dl_status:
             st.markdown(st.session_state.dl_status)
 
