@@ -72,8 +72,6 @@ def _init_state() -> None:
         "dl_balloons_shown": False,   # prevents balloons from re-firing on reruns
         "dl_pp_label": None,          # label of current postprocessor (for live elapsed)
         "dl_pp_start": None,          # monotonic timestamp when current PP started
-        "dl_pp_frac": 0.0,            # progress 0..1 of current ffmpeg PP
-        "dl_pp_eta": None,            # ETA string of current ffmpeg PP, or None
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -420,15 +418,69 @@ def _stream_label(d: dict) -> str:
 class _QueueProgress:
     """Writes progress updates to a queue instead of Streamlit directly."""
 
-    def __init__(self, q: queue.Queue, cancel: threading.Event):
+    def __init__(self, q: queue.Queue, cancel: threading.Event,
+                 output_dir: Path | None = None):
         self._q = q
         self._cancel = cancel
+        self._output_dir = output_dir
         self._dl_start: float | None = None
         self._current_pp: str | None = None
         self._pp_start: float | None = None
+        self._finished = threading.Event()
+        # FFmpegFD (acionado por download_ranges) não emite progress hooks
+        # durante o download — sem este thread, a UI fica em branco enquanto
+        # o trim baixa. O thread polla o `.part` mais recente e empurra
+        # mensagens de progresso sintéticas só enquanto:
+        #  - o cancel não foi acionado
+        #  - o stop_polling() ainda não foi chamado (download terminou)
+        #  - nenhum hook real de download disparou (HttpFD natural)
+        #  - nenhum postprocessor está rodando (PP tem seu próprio label)
+        if output_dir is not None:
+            t = threading.Thread(target=self._poll_part_loop, daemon=True)
+            t.start()
 
     def _put(self, msg: dict) -> None:
         self._q.put_nowait(msg)
+
+    def stop_polling(self) -> None:
+        """Sinaliza ao thread de polling para encerrar (chamado quando
+        o download() retorna, com sucesso ou erro)."""
+        self._finished.set()
+
+    def _poll_part_loop(self) -> None:
+        poll_start = time.monotonic()
+        last_status = ""
+        while not self._cancel.is_set() and not self._finished.is_set():
+            time.sleep(1.0)
+            if self._cancel.is_set() or self._finished.is_set():
+                return
+            # Quando o yt-dlp já está reportando progresso de verdade ou
+            # quando algum PP iniciou, deixamos a UI seguir esses sinais.
+            if self._dl_start is not None or self._current_pp is not None:
+                continue
+            if not self._output_dir or not self._output_dir.exists():
+                continue
+            try:
+                parts = [p for p in self._output_dir.rglob("*.part") if p.is_file()]
+            except OSError:
+                continue
+            if not parts:
+                continue
+            try:
+                latest = max(parts, key=lambda p: p.stat().st_mtime)
+                size = latest.stat().st_size
+            except (OSError, ValueError):
+                continue
+            elapsed = time.monotonic() - poll_start
+            status = (
+                f"⬇ Baixando trecho — `{latest.name}`  \n"
+                f"{core.format_bytes(size)} • ⏱ {_fmt_elapsed(elapsed)}"
+            )
+            # Evita inundar a queue se a mensagem é idêntica (mesmo tamanho).
+            if status == last_status:
+                continue
+            last_status = status
+            self._put({"type": "progress", "bar": None, "status": status})
 
     def hook(self, d: dict) -> None:
         if self._cancel.is_set():
@@ -505,20 +557,6 @@ class _QueueProgress:
     def notify(self, msg: str) -> None:
         self._put({"type": "progress", "bar": 0.0, "status": msg})
 
-    def pp_progress(self, frac: float, elapsed_us: int, total_us: int) -> None:
-        # Chamado pelo monkey-patch de FFmpegPostProcessor.real_run_ffmpeg.
-        # Calcula ETA aproximada com base no progresso linear desde o início do PP.
-        eta_str: str | None = None
-        if self._pp_start and frac > 0.01:
-            run_elapsed = time.monotonic() - self._pp_start
-            remaining = run_elapsed * (1.0 - frac) / frac
-            eta_str = _fmt_elapsed(remaining)
-        self._put({
-            "type": "pp_progress",
-            "frac": min(max(frac, 0.0), 1.0),
-            "eta": eta_str,
-        })
-
     def reset_phase(self) -> None:
         # Chamado entre passes de download (ex: vídeo → legendas separadas)
         # para evitar que timers/labels do passe anterior vazem no próximo.
@@ -531,7 +569,9 @@ class _QueueProgress:
 def _download_worker(urls: list[str], opts: dict,
                      q: queue.Queue, cancel: threading.Event) -> None:
     """Runs in a background thread. Puts result dict into q when done."""
-    progress = _QueueProgress(q, cancel)
+    output_dir_str = opts.pop("_output_dir", "")
+    output_dir = Path(output_dir_str) if output_dir_str else None
+    progress = _QueueProgress(q, cancel, output_dir=output_dir)
     _ydl_errors: list[str] = []
 
     class _Logger:
@@ -541,8 +581,6 @@ def _download_worker(urls: list[str], opts: dict,
         def error(self, msg: str) -> None:
             _ydl_errors.append(_ANSI_RE.sub("", msg))
 
-    output_dir_str = opts.pop("_output_dir", "")
-    output_dir = Path(output_dir_str) if output_dir_str else None
     full_opts = {
         **opts,
         "progress_hooks": [progress.hook],
@@ -551,14 +589,12 @@ def _download_worker(urls: list[str], opts: dict,
         "_reset_phase": progress.reset_phase,
         "logger": _Logger(),
     }
-    # Registra callback que recebe progresso real do ffmpeg (parseado do
-    # `-progress pipe:1` injetado pelo monkey-patch em core.real_run_ffmpeg).
-    core.set_pp_progress_callback(progress.pp_progress)
     try:
         rc = core.download(urls, full_opts)
         err = _ydl_errors[-1] if _ydl_errors and rc != 0 else None
     except SystemExit:
         # Raised by progress hook when cancel event is set
+        progress.stop_polling()
         if output_dir:
             _cleanup_partial_files(output_dir)
         q.put_nowait({"type": "done", "rc": -1, "err": None, "cancelled": True})
@@ -566,14 +602,14 @@ def _download_worker(urls: list[str], opts: dict,
     except Exception as e:
         # If cancel was triggered (e.g. ffmpeg killed mid-postprocess), yt-dlp
         # surfaces a PostProcessingError here — treat it as a user cancellation.
+        progress.stop_polling()
         if cancel.is_set():
             if output_dir:
                 _cleanup_partial_files(output_dir)
             q.put_nowait({"type": "done", "rc": -1, "err": None, "cancelled": True})
             return
         rc, err = 1, _ANSI_RE.sub("", str(e))
-    finally:
-        core.set_pp_progress_callback(None)
+    progress.stop_polling()
     q.put_nowait({"type": "done", "rc": rc, "err": err, "cancelled": False})
 
 
@@ -727,6 +763,7 @@ def render_download_options(key_prefix: str,
 
         # ---- Legendas: picker por idioma ----
         show_subs_picker = mode in ("Vídeo + áudio", "Apenas vídeo", "Apenas legendas")
+        want_subs: bool = (mode == "Apenas legendas")
         if show_subs_picker:
             st.markdown("**📝 Legendas**")
             manual_subs, auto_subs = _available_subtitles(info)
@@ -806,7 +843,9 @@ def render_download_options(key_prefix: str,
                             key=f"{key_prefix}_embed_subs",
                             help=(
                                 "Mais lento — ffmpeg re-multiplexa o vídeo no final. "
-                                "Quando desmarcado, o `.srt` é salvo ao lado do vídeo."
+                                "Marcado: a legenda fica embutida e o `.srt` é "
+                                "removido. Desmarcado: o `.srt` é salvo ao "
+                                "lado do vídeo, sem embutir."
                             ),
                         )
             else:
@@ -828,7 +867,9 @@ def render_download_options(key_prefix: str,
                             key=f"{key_prefix}_embed_subs",
                             help=(
                                 "Mais lento — ffmpeg re-multiplexa o vídeo no final. "
-                                "Quando desmarcado, o `.srt` é salvo ao lado do vídeo."
+                                "Marcado: a legenda fica embutida e o `.srt` é "
+                                "removido. Desmarcado: o `.srt` é salvo ao "
+                                "lado do vídeo, sem embutir."
                             ),
                         )
 
@@ -883,9 +924,9 @@ def render_download_options(key_prefix: str,
                     value=False,
                     key=f"{key_prefix}_kf",
                     help=(
-                        "Muito mais lento — baixa o vídeo inteiro e re-encoda via ffmpeg. "
-                        "Marque só se precisar de corte exato no frame pedido. "
-                        "Desmarcado: ffmpeg baixa direto o intervalo (mais rápido)."
+                        "Marcado: ffmpeg re-encoda o trecho — corte exato no "
+                        "frame pedido (mais lento). Desmarcado: stream copy "
+                        "— corte no keyframe mais próximo (mais rápido)."
                     ),
                 )
             else:
@@ -905,6 +946,17 @@ def render_download_options(key_prefix: str,
     audio_only = (mode == "Apenas áudio")
     subtitles_only = (mode == "Apenas legendas")
     has_subs = bool(selected_sub_langs)
+
+    # "Baixar legendas" marcado mas nenhum idioma selecionado → bloqueia o
+    # download para o usuário não pensar que conseguiu baixar legenda quando
+    # nenhuma será gerada. Não vale para subtitles_only (que tem fallback) e
+    # nem para o caminho "Nenhuma legenda encontrada" (que define langs default).
+    subs_error = bool(want_subs and not has_subs and not subtitles_only)
+    if subs_error:
+        st.error(
+            "❌ Você marcou **Baixar legendas** mas não selecionou nenhum "
+            "idioma. Selecione pelo menos um, ou desmarque a opção."
+        )
 
     if mode == "Apenas vídeo":
         if quality_h:
@@ -929,6 +981,7 @@ def render_download_options(key_prefix: str,
         "subtitles_only": subtitles_only,
         "embed_subtitles": embed_subs,
         "_trim_error": trim_error,
+        "_subs_error": subs_error,
     }
     if selected_sub_langs:
         result["subtitles_langs"] = selected_sub_langs
@@ -1182,6 +1235,14 @@ def _dispatch_download(urls: list[str], opts_kwargs: dict,
         st.error("❌ Corrija os tempos de corte antes de baixar.")
         return
 
+    subs_error = opts_kwargs.pop("_subs_error", False)
+    if subs_error:
+        st.error(
+            "❌ Marque ao menos um idioma de legenda — ou desmarque "
+            "**Baixar legendas** — antes de iniciar o download."
+        )
+        return
+
     output_dir = st.session_state["output_dir"].strip()
     if not output_dir:
         st.error("❌ Pasta de saída não pode ser vazia.")
@@ -1283,8 +1344,6 @@ def _start_download(urls: list[str], opts_kwargs: dict,
     st.session_state.dl_balloons_shown = False
     st.session_state.dl_pp_label = None
     st.session_state.dl_pp_start = None
-    st.session_state.dl_pp_frac = 0.0
-    st.session_state.dl_pp_eta = None
 
     t.start()
     st.rerun()
@@ -1314,18 +1373,10 @@ def _drain_queue() -> None:
         elif msg["type"] == "pp_start":
             st.session_state.dl_pp_label = msg["label"]
             st.session_state.dl_pp_start = msg["start"]
-            st.session_state.dl_pp_frac = 0.0
-            st.session_state.dl_pp_eta = None
-            st.session_state.dl_bar = 0.0  # bar agora reflete o progresso do PP
-        elif msg["type"] == "pp_progress":
-            st.session_state.dl_pp_frac = msg.get("frac", 0.0)
-            st.session_state.dl_pp_eta = msg.get("eta")
-            st.session_state.dl_bar = st.session_state.dl_pp_frac
+            st.session_state.dl_bar = 1.0
         elif msg["type"] == "pp_end":
             st.session_state.dl_pp_label = None
             st.session_state.dl_pp_start = None
-            st.session_state.dl_pp_frac = 0.0
-            st.session_state.dl_pp_eta = None
         elif msg["type"] == "log":
             st.session_state.dl_log.append(msg["msg"])
         elif msg["type"] == "done":
@@ -1474,23 +1525,14 @@ def render_download_section() -> None:
         bar_val = min(max(float(st.session_state.dl_bar), 0.0), 1.0)
         st.progress(bar_val)
 
-        # Live status text: during a postprocessor run, show label + elapsed
-        # (+ ETA + % from real ffmpeg progress, when available). Outside of PPs,
-        # show whatever the download hook last pushed (download progress text
-        # with ETA/speed, or the "Processando com ffmpeg…" placeholder).
+        # Live status text: during a postprocessor run, show label + elapsed.
+        # Outside of it, show whatever the download hook last pushed (download
+        # progress text with ETA/speed, or the "Processando com ffmpeg…" placeholder).
         pp_label = st.session_state.dl_pp_label
         pp_start = st.session_state.dl_pp_start
         if pp_label and pp_start is not None:
             pp_elapsed = _fmt_elapsed(time.monotonic() - pp_start)
-            pp_frac = st.session_state.dl_pp_frac
-            pp_eta = st.session_state.dl_pp_eta
-            extras: list[str] = []
-            if pp_frac > 0:
-                extras.append(f"{pp_frac * 100:.0f}%")
-            if pp_eta:
-                extras.append(f"ETA {pp_eta}")
-            extras.append(f"⏱ {pp_elapsed}")
-            st.markdown(f"⚙️ **{pp_label}…** — {' • '.join(extras)}")
+            st.markdown(f"⚙️ **{pp_label}…** — ⏱ {pp_elapsed}")
         elif st.session_state.dl_status:
             st.markdown(st.session_state.dl_status)
 

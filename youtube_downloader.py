@@ -22,16 +22,11 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 import yt_dlp
-from yt_dlp.utils import download_range_func
-from yt_dlp.postprocessor.ffmpeg import (
-    FFmpegPostProcessor, FFmpegPostProcessorError,
-)
+from yt_dlp.utils import ISO639Utils
 
 
 # ================================================================
@@ -446,11 +441,11 @@ def build_options(
     # Legendas — configuração base (langs, etc.)
     _subs_langs = subtitles_langs or ["pt", "pt-BR", "en"]
 
-    # Quando há trim + legendas juntos, yt-dlp pode corromper o vídeo.
-    # Solução: separar em dois passes — vídeo trimado sem legendas,
-    # depois legendas baixadas à parte e trimadas por nós.
-    # Se o trim cobre o vídeo todo, tratamos como sem-trim para evitar
-    # re-encode e dois-passes desnecessários.
+    # Trim ativo: usa `download_ranges` do yt-dlp (eficiente — baixa só o
+    # intervalo). Quando há legendas + trim, separamos em dois passes
+    # (vídeo trimado, legendas inteiras) porque baixar legendas com trim
+    # no mesmo passe corrompe o vídeo. Se o trim cobre o vídeo todo,
+    # tratamos como sem-trim para evitar re-encode desnecessário.
     trim_active = has_trim and not trim_covers_full
     _need_separate_subs = (write_subtitles and trim_active and not subtitles_only)
 
@@ -470,13 +465,13 @@ def build_options(
             "format": "srt",
             "when": "before_dl",
         })
-        # Embutir legendas no container (opt-in pelo usuário)
+        # Embutir legendas no container (opt-in pelo usuário).
+        # already_have_subtitle=False (default) faz o PP apagar o .srt após
+        # embutir — assim o diretório de saída só contém o vídeo final, com
+        # `language=por/eng/...` corretamente preenchido (ISO 639-2).
         if embed_subtitles and not audio_only and not subtitles_only:
             postprocessors.append({
                 "key": "FFmpegEmbedSubtitle",
-                # já temos as legendas em arquivo separado: não apagar após
-                # embutir, para o usuário manter ambas as cópias.
-                "already_have_subtitle": True,
             })
 
     # Cookies
@@ -489,31 +484,37 @@ def build_options(
     if playlist_items:
         opts["playlist_items"] = playlist_items
 
-    # Cortes (trim) — só aplica se trim_active (não coberto pela duração total)
+    # Cortes (trim) — só aplica se trim_active (não coberto pela duração total).
+    # Estratégia: download completo via DASH, depois trim local com ffmpeg.
+    # Não usamos `download_ranges`/FFmpegFD porque FFmpegFD adiciona `-ss N`
+    # ANTES de `-i URL`, forçando accurate seek por leitura integral do stream
+    # HTTP — para start>0 isso trava o download. Trim local opera sobre o
+    # arquivo já mesclado no disco; -ss em arquivo local usa o índice do
+    # container, sem seek HTTP.
     if trim_active:
         start = float(trim_start) if trim_start is not None else 0.0
         end = float(trim_end) if trim_end is not None else None
         if not subtitles_only:
-            # external_downloader=ffmpeg com -ss/-to trava em DASH do YouTube
-            # (android_vr/SABR exige o downloader de fragmentos nativo do yt-dlp).
-            # Sempre usar download_ranges; só alternar keyframes vs. re-encode.
-            ranges = [(start, end if end is not None else float("inf"))]
-            opts["download_ranges"] = download_range_func(None, ranges)
-            opts["force_keyframes_at_cuts"] = bool(force_keyframes_at_cuts)
-        # Marca legendas para trimming pós-download
+            opts["_trim_postprocess"] = {
+                "start": start,
+                "end": end,
+                # True  → output seeking + re-encode (frame-accurate)
+                # False → input seeking + stream copy (corte no keyframe)
+                "force_keyframes": bool(force_keyframes_at_cuts),
+            }
         if write_subtitles or subtitles_only:
             opts["_subtitle_trim"] = {
                 "trim_start": start,
                 "trim_end": end,
             }
 
-    # Sinaliza que legendas precisam ser baixadas separadamente
+    # Sinaliza que legendas precisam ser baixadas em passe separado.
     if _need_separate_subs:
-        opts["_separate_subs"] = {
-            "langs": _subs_langs,
-        }
-        # Embutir legendas no container após o trimming (opt-in)
+        opts["_separate_subs"] = {"langs": _subs_langs}
         if embed_subtitles and not audio_only:
+            # Sinaliza para `download()` rodar o embed manual após o trim
+            # das legendas. Usa `_embed_subs_in_video`, que aplica os mesmos
+            # códigos ISO 639-2 que o FFmpegEmbedSubtitle do yt-dlp.
             opts["_embed_subs"] = True
 
     if postprocessors:
@@ -570,15 +571,21 @@ def extract_playlist_flat(
 
 
 # ================================================================
-# Embutir legendas no container
+# Embutir legendas no container (caminho trim+embed)
 # ================================================================
 
 def _embed_subs_in_video(srt_files: Iterable[Path]) -> None:
-    """Embutem arquivos SRT no container de vídeo correspondente.
+    """Embute SRTs no vídeo correspondente, replicando o comportamento de
+    metadata do FFmpegEmbedSubtitle do yt-dlp.
 
-    Agrupa por base do nome (``video.lang.srt`` → ``video``) e localiza
-    o arquivo de vídeo com mesmo stem.  Para cada grupo, executa ffmpeg
-    para adicionar as trilhas de legenda com metadado ``language``.
+    Agrupa por base do nome (``video.lang.srt`` → ``video``), localiza o
+    vídeo com mesmo stem, e adiciona cada legenda como nova trilha. O código
+    de idioma é convertido para ISO 639-2 (3 letras: ``por``, ``eng``, etc.)
+    via ``ISO639Utils.short2long`` — sem isso, players exibem só "Trilha N"
+    em vez do nome do idioma. Define também o ``title`` (rótulo legível).
+
+    Após embutir com sucesso, o arquivo .srt original é apagado, espelhando
+    o ``already_have_subtitle=False`` do PP nativo.
     """
     from collections import defaultdict
 
@@ -608,7 +615,12 @@ def _embed_subs_in_video(srt_files: Iterable[Path]) -> None:
         for i, (lang, srt_path) in enumerate(langs):
             cmd += ["-i", str(srt_path)]
             maps += ["-map", str(i + 1)]
-            metadata += [f"-metadata:s:s:{i}", f"language={lang}"]
+            # ISO 639-2 (3 letras) é o que players reconhecem para mostrar
+            # o nome do idioma; lang aqui pode vir como 'pt', 'pt-BR', 'en',
+            # 'en-US' etc. short2long lida com a conversão.
+            iso = ISO639Utils.short2long(lang.split("-")[0]) or lang
+            metadata += [f"-metadata:s:s:{i}", f"language={iso}"]
+            metadata += [f"-metadata:s:s:{i}", f"title={lang}"]
 
         tmp_path = video_path.with_name(video_path.stem + ".tmp" + video_path.suffix)
         cmd += maps + ["-c", "copy", "-c:s", sub_codec] + metadata + [str(tmp_path)]
@@ -617,144 +629,72 @@ def _embed_subs_in_video(srt_files: Iterable[Path]) -> None:
             subprocess.run(cmd, check=True, capture_output=True)
             video_path.unlink()
             tmp_path.rename(video_path)
+            # Mesmo comportamento de already_have_subtitle=False: apaga o .srt.
+            for _, srt_path in langs:
+                try:
+                    srt_path.unlink()
+                except OSError:
+                    pass
         except subprocess.CalledProcessError:
             if tmp_path.exists():
                 tmp_path.unlink()
 
 
 # ================================================================
-# Progresso ao vivo dos postprocessors ffmpeg
+# Trim de vídeo local (pós-download)
 # ================================================================
-#
-# yt-dlp roda os PPs ffmpeg via subprocess.Popen bloqueante: nenhum hook
-# emite progresso em tempo real. Para a UI mostrar bar/ETA durante merge,
-# trim re-encode, embed etc., monkey-patcheamos `real_run_ffmpeg`:
-#  - injeta `-progress pipe:1 -nostats` para o ffmpeg emitir métricas
-#  - lê stdout linha-a-linha em foreground (out_time_us=, progress=)
-#  - lê stderr em thread (parse de Duration: HH:MM:SS.mm + buffer p/ erros)
-#  - chama _PP_PROGRESS_CALLBACK(frac, elapsed_us, total_us)
 
-_PP_PROGRESS_CALLBACK: Optional[Callable[[float, int, int], None]] = None
-_FFPROGRESS_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
+_VIDEO_EXTS = frozenset((".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"))
 
 
-def set_pp_progress_callback(fn: Optional[Callable[[float, int, int], None]]) -> None:
-    """Registra callback chamado durante PPs ffmpeg. Thread-safe (1 download/vez)."""
-    global _PP_PROGRESS_CALLBACK
-    _PP_PROGRESS_CALLBACK = fn
+def _trim_video_file(
+    filepath: Path,
+    start: float,
+    end: float | None,
+    force_keyframes: bool,
+) -> None:
+    """Recorta `filepath` para o intervalo [start, end) usando ffmpeg local.
 
+    Operação feita sobre o arquivo já baixado e mesclado — sem seek HTTP,
+    sem risco de travamento. Substitui o arquivo original pelo recortado.
 
-_orig_real_run_ffmpeg = FFmpegPostProcessor.real_run_ffmpeg
+    force_keyframes=False → input seeking + stream copy: keyframe-aligned start,
+                            sem re-encode, muito rápido.
+    force_keyframes=True  → output seeking + re-encode: decodifica e descarta
+                            até o frame exato em `start`, re-encoda. Para
+                            arquivos locais o overhead é mínimo (sem HTTP).
+    """
+    if not filepath.exists():
+        return
 
+    duration = (end - start) if end is not None else None
+    tmp_path = filepath.with_name(filepath.stem + ".trim_tmp" + filepath.suffix)
 
-def _patched_real_run_ffmpeg(self, input_path_opts, output_path_opts,
-                             *, expected_retcodes=(0,)):
-    """Drop-in replacement de real_run_ffmpeg que emite progresso."""
-    # Sem callback configurado → fallback transparente para o original
-    if _PP_PROGRESS_CALLBACK is None:
-        return _orig_real_run_ffmpeg(
-            self, input_path_opts, output_path_opts,
-            expected_retcodes=expected_retcodes,
-        )
+    if force_keyframes:
+        # Output seeking (-ss depois de -i): decodifica localmente desde o
+        # keyframe mais próximo a `start`, descarta até o frame exato.
+        # Sem -c copy → ffmpeg re-encoda para corte frame-accurate.
+        cmd: list[str] = ["ffmpeg", "-y", "-i", str(filepath),
+                          "-ss", str(start)]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += ["-c:a", "copy", "-avoid_negative_ts", "make_zero", str(tmp_path)]
+    else:
+        # Input seeking (-ss antes de -i): usa índice do container para
+        # posicionar no keyframe mais próximo a `start`. Muito rápido em
+        # arquivos locais. Stream copy sem re-encode.
+        cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(filepath)]
+        if duration is not None:
+            cmd += ["-t", str(duration)]
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", str(tmp_path)]
 
-    import itertools as _it
-    import os as _os
-
-    self.check_version()
-    oldest_mtime = min(
-        _os.stat(path).st_mtime for path, _ in input_path_opts if path)
-
-    cmd = [self.executable, "-y"]
-    if self.basename == "ffmpeg":
-        cmd += ["-loglevel", "repeat+info", "-progress", "pipe:1", "-nostats"]
-
-    def make_args(file, args, name, number):
-        keys = [f"_{name}{number}", f"_{name}"]
-        if name == "o":
-            args += ["-movflags", "+faststart"]
-            if number == 1:
-                keys.append("")
-        args += self._configuration_args(self.basename, keys)
-        if name == "i":
-            args.append("-i")
-        return [*args, self._ffmpeg_filename_argument(file)]
-
-    for arg_type, path_opts in (("i", input_path_opts), ("o", output_path_opts)):
-        cmd += list(_it.chain.from_iterable(
-            make_args(path, list(opts), arg_type, i + 1)
-            for i, (path, opts) in enumerate(path_opts) if path))
-
-    self.write_debug(f"ffmpeg command line: {cmd}")
-
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        stdin=subprocess.PIPE, text=True, bufsize=1,
-    )
-
-    duration_us = {"value": 0}  # mutável p/ thread reader
-    stderr_buf: list[str] = []
-
-    def _read_stderr() -> None:
-        for line in proc.stderr:
-            stderr_buf.append(line)
-            if not duration_us["value"]:
-                m = _FFPROGRESS_DURATION_RE.search(line)
-                if m:
-                    h, mn, s = m.groups()
-                    duration_us["value"] = int(
-                        (int(h) * 3600 + int(mn) * 60 + float(s)) * 1_000_000
-                    )
-
-    t = threading.Thread(target=_read_stderr, daemon=True)
-    t.start()
-
-    last_emit = 0.0
-    last_out_us = 0
     try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line.startswith("out_time_us="):
-                continue
-            try:
-                cur_us = int(line.split("=", 1)[1])
-            except ValueError:
-                continue
-            last_out_us = cur_us
-            now = time.monotonic()
-            # throttle a 4 Hz para não inundar a queue da UI
-            if now - last_emit < 0.25:
-                continue
-            last_emit = now
-            total = duration_us["value"]
-            frac = (cur_us / total) if total else 0.0
-            try:
-                _PP_PROGRESS_CALLBACK(min(frac, 1.0), cur_us, total)
-            except Exception:
-                pass
-    finally:
-        proc.wait()
-        t.join(timeout=2)
-
-    stderr = "".join(stderr_buf)
-    if proc.returncode not in (expected_retcodes if isinstance(expected_retcodes, tuple) else (expected_retcodes,)):
-        last = (stderr.strip().splitlines() or [""])[-1]
-        raise FFmpegPostProcessorError(last)
-
-    # Tick final em 100% para garantir bar cheia ao concluir
-    try:
-        _PP_PROGRESS_CALLBACK(1.0, last_out_us, duration_us["value"])
-    except Exception:
-        pass
-
-    for out_path, _ in output_path_opts:
-        if out_path:
-            self.try_utime(out_path, oldest_mtime, oldest_mtime)
-    return stderr
-
-
-# Aplica o patch uma única vez no import. Os PPs do yt-dlp todos chamam
-# real_run_ffmpeg via run_ffmpeg/run_ffmpeg_multiple_files.
-FFmpegPostProcessor.real_run_ffmpeg = _patched_real_run_ffmpeg
+        subprocess.run(cmd, check=True, capture_output=True)
+        filepath.unlink()
+        tmp_path.rename(filepath)
+    except subprocess.CalledProcessError:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 # ================================================================
@@ -771,38 +711,61 @@ def download(urls: Iterable[str], opts: dict) -> int:
     subtitle_trim = opts.pop("_subtitle_trim", None)
     separate_subs = opts.pop("_separate_subs", None)
     embed_subs = opts.pop("_embed_subs", False)
-    notify = opts.pop("_notify", None)  # Optional[Callable[[str], None]]
-    reset_phase = opts.pop("_reset_phase", None)  # Optional[Callable[[], None]]
+    trim_postprocess = opts.pop("_trim_postprocess", None)
+    notify = opts.pop("_notify", None)              # Callable[[str], None]
+    reset_phase = opts.pop("_reset_phase", None)    # Callable[[], None]
 
-    # Rastreia legendas existentes para trimming/embedding posterior
+    # Rastreia legendas existentes para identificar as novas após o download
     outtmpl = opts.get("outtmpl", "%(title)s.%(ext)s")
     output_dir = Path(outtmpl).parent
     pre_subs: set[Path] = set()
     if (subtitle_trim or embed_subs) and output_dir.exists():
         pre_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
 
+    # Rastreia vídeos existentes para identificar o arquivo novo após o download
+    pre_videos: set[Path] = set()
+    if trim_postprocess and output_dir.exists():
+        pre_videos = {
+            p for p in output_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in _VIDEO_EXTS
+        }
+
     # Mensagem inicial — o progress_hook só dispara depois que yt-dlp resolve
     # a URL e baixa o primeiro fragmento; até lá o status ficaria em "Iniciando…".
     if notify:
-        if opts.get("download_ranges"):
-            if opts.get("force_keyframes_at_cuts"):
-                notify(
-                    "✂️ Trim com re-encode — baixando o intervalo e "
-                    "re-codificando para corte frame-accurate (pode demorar)…"
-                )
-            else:
-                notify(
-                    "✂️ Trim rápido — baixando só o intervalo (corte no "
-                    "keyframe mais próximo)…"
-                )
-        else:
-            notify("🔗 Resolvendo URL do YouTube…")
+        notify("🔗 Resolvendo URL do YouTube…")
 
-    # ---- Passo 1: download principal (vídeo/áudio, SEM legendas se trim ativo) ----
+    # ---- Passo 1: download principal (vídeo+áudio, sem legendas se trim) ----
     with yt_dlp.YoutubeDL(opts) as ydl:
         rc = ydl.download(urls)
 
+    # ---- Passo 1b: trim local do vídeo (se ativo) ----
+    # Executado após o download + merge completos, sobre o arquivo final no disco.
+    if trim_postprocess and rc == 0 and output_dir.exists():
+        post_videos = {
+            p for p in output_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in _VIDEO_EXTS
+        }
+        new_videos = post_videos - pre_videos
+        for video_file in sorted(new_videos):
+            if notify:
+                if trim_postprocess["force_keyframes"]:
+                    notify(
+                        "✂️ Trim com re-encode — recortando para corte "
+                        "frame-accurate…"
+                    )
+                else:
+                    notify("✂️ Trim rápido — recortando no keyframe mais próximo…")
+            _trim_video_file(
+                video_file,
+                trim_postprocess["start"],
+                trim_postprocess["end"],
+                trim_postprocess["force_keyframes"],
+            )
+
     # ---- Passo 2: legendas separadas (quando trim + legendas juntos) ----
+    # Trim+legendas no MESMO download do yt-dlp pode corromper o vídeo, então
+    # rodamos um segundo passe só para legendas (sem trim, baixadas inteiras).
     if separate_subs is not None:
         if reset_phase:
             reset_phase()
@@ -813,7 +776,6 @@ def download(urls: Iterable[str], opts: dict) -> int:
         subs_opts["writesubtitles"] = True
         subs_opts["writeautomaticsub"] = True
         subs_opts["subtitleslangs"] = separate_subs["langs"]
-        # Mesma lógica do passo 1: prefere srt, fallback vtt → convertor pega.
         subs_opts["subtitlesformat"] = "srt/vtt/best"
         subs_opts["outtmpl"] = outtmpl
         subs_opts["noplaylist"] = opts.get("noplaylist", True)
@@ -822,7 +784,6 @@ def download(urls: Iterable[str], opts: dict) -> int:
             "format": "srt",
             "when": "before_dl",
         }]
-        # Propagar hooks, cookies e logger do opts original
         for key in ("cookiefile", "cookiesfrombrowser", "playlist_items",
                     "progress_hooks", "postprocessor_hooks", "logger"):
             if key in opts:
@@ -831,7 +792,7 @@ def download(urls: Iterable[str], opts: dict) -> int:
         with yt_dlp.YoutubeDL(subs_opts) as ydl:
             ydl.download(urls)  # ignora retcode das legendas
 
-    # ---- Passo 3: identifica legendas novas e recorta se necessário ----
+    # ---- Passo 3: identifica legendas novas e recorta para o intervalo ----
     new_subs: set[Path] = set()
     if (subtitle_trim or embed_subs) and output_dir.exists():
         post_subs = set(output_dir.rglob("*.srt")) | set(output_dir.rglob("*.vtt"))
@@ -846,7 +807,7 @@ def download(urls: Iterable[str], opts: dict) -> int:
                     subtitle_trim["trim_end"],
                 )
 
-    # ---- Passo 4: embutir legendas no container (trim + legendas) ----
+    # ---- Passo 4: embutir legendas no container (trim + embed) ----
     if embed_subs and new_subs:
         srt_only = [f for f in new_subs if f.suffix == ".srt"]
         if srt_only:
