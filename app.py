@@ -16,10 +16,12 @@ Pré-requisitos do sistema (ver sidebar "Status do ambiente"):
 
 from __future__ import annotations
 
+import hmac
 import os
 import queue
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -72,6 +74,9 @@ def _init_state() -> None:
         "dl_balloons_shown": False,   # prevents balloons from re-firing on reruns
         "dl_pp_label": None,          # label of current postprocessor (for live elapsed)
         "dl_pp_start": None,          # monotonic timestamp when current PP started
+        "dl_files": [],               # paths of new files created by last download
+        "dl_files_before": set(),     # snapshot of existing files before download started
+        "_authenticated": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -106,7 +111,7 @@ def _next_available_suffix(expected_stem: Path, final_ext: str) -> str:
 
 
 def _kill_ffmpeg_children() -> None:
-    """Terminate ffmpeg.exe processes spawned by our Python process.
+    """Terminate ffmpeg processes spawned by our Python process.
 
     yt-dlp runs ffmpeg via subprocess.Popen as a child of the current process,
     so filtering by ParentProcessId avoids killing unrelated ffmpeg instances.
@@ -115,16 +120,22 @@ def _kill_ffmpeg_children() -> None:
     """
     try:
         pid = os.getpid()
-        script = (
-            f"Get-CimInstance Win32_Process -Filter "
-            f"\"Name='ffmpeg.exe' AND ParentProcessId={pid}\" | "
-            f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
-            f"-ErrorAction SilentlyContinue }}"
-        )
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True, timeout=5, check=False,
-        )
+        if sys.platform == "win32":
+            script = (
+                f"Get-CimInstance Win32_Process -Filter "
+                f"\"Name='ffmpeg.exe' AND ParentProcessId={pid}\" | "
+                f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
+                f"-ErrorAction SilentlyContinue }}"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, timeout=5, check=False,
+            )
+        else:
+            subprocess.run(
+                ["pkill", "-P", str(pid), "ffmpeg"],
+                capture_output=True, timeout=5, check=False,
+            )
     except Exception:
         pass
 
@@ -240,8 +251,38 @@ def _env_status() -> dict:
     }
 
 
+def _render_login() -> None:
+    """Mostra tela de login. Se não houver senha configurada, autentica automaticamente."""
+    try:
+        expected = st.secrets["app"]["password"]
+    except Exception:
+        expected = ""
+
+    if not expected:
+        # Sem senha configurada → modo dev local, sem auth
+        st.session_state["_authenticated"] = True
+        st.rerun()
+        return
+
+    st.title("🎬 YouTube Downloader")
+    st.markdown("### Acesso restrito")
+    with st.form("login_form"):
+        pwd = st.text_input("Senha", type="password")
+        submitted = st.form_submit_button("Entrar", type="primary")
+    if submitted:
+        if pwd and hmac.compare_digest(pwd.encode(), expected.encode()):
+            st.session_state["_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Senha incorreta.")
+
+
 def render_sidebar() -> None:
     st.sidebar.title("⚙️ Configuração")
+
+    if st.sidebar.button("🚪 Sair"):
+        st.session_state["_authenticated"] = False
+        st.rerun()
 
     # ---- Status ----
     st.sidebar.subheader("Status do ambiente")
@@ -258,13 +299,24 @@ def render_sidebar() -> None:
     )
 
     if not deno_v:
-        st.sidebar.error(
-            "Deno é **obrigatório** para o YouTube. Instale no PowerShell:\n\n"
-            "`winget install DenoLand.Deno`\n\n"
-            "Depois feche e reabra o terminal."
-        )
+        if sys.platform == "win32":
+            st.sidebar.error(
+                "Deno é **obrigatório** para o YouTube. Instale no PowerShell:\n\n"
+                "`winget install DenoLand.Deno`\n\n"
+                "Depois feche e reabra o terminal."
+            )
+        else:
+            st.sidebar.error(
+                "Deno é **obrigatório** para o YouTube. Instale:\n\n"
+                "`curl -fsSL https://deno.land/install.sh | sh`\n\n"
+                "Depois adicione ao PATH:\n"
+                "`echo 'export PATH=\"$HOME/.deno/bin:$PATH\"' >> ~/.bashrc && source ~/.bashrc`"
+            )
     if not ff_ok:
-        st.sidebar.error("Instale ffmpeg: `winget install Gyan.FFmpeg`")
+        if sys.platform == "win32":
+            st.sidebar.error("Instale ffmpeg: `winget install Gyan.FFmpeg`")
+        else:
+            st.sidebar.error("Instale ffmpeg: `sudo apt install -y ffmpeg`")
     if not fx_ok:
         st.sidebar.warning(
             "Firefox não detectado. Instale em firefox.com, logue no "
@@ -282,14 +334,15 @@ def render_sidebar() -> None:
 
     # ---- Config geral ----
     st.sidebar.subheader("Opções gerais")
-    if st.sidebar.button("📂 Escolher pasta"):
-        selected_dir = _ask_directory_popup()
-        if selected_dir:
-            st.session_state["output_dir"] = selected_dir
-            st.session_state["output_dir_input"] = selected_dir
-            st.rerun()
-        else:
-            st.sidebar.info("Nenhuma pasta foi selecionada.")
+    if sys.platform == "win32":
+        if st.sidebar.button("📂 Escolher pasta"):
+            selected_dir = _ask_directory_popup()
+            if selected_dir:
+                st.session_state["output_dir"] = selected_dir
+                st.session_state["output_dir_input"] = selected_dir
+                st.rerun()
+            else:
+                st.sidebar.info("Nenhuma pasta foi selecionada.")
 
     st.sidebar.text_input(
         "Pasta de saída",
@@ -1344,6 +1397,14 @@ def _start_download(urls: list[str], opts_kwargs: dict,
     st.session_state.dl_balloons_shown = False
     st.session_state.dl_pp_label = None
     st.session_state.dl_pp_start = None
+    # Snapshot de arquivos existentes para calcular o diff após o download
+    try:
+        st.session_state.dl_files_before = {
+            str(p) for p in output_path.rglob("*") if p.is_file()
+        }
+    except OSError:
+        st.session_state.dl_files_before = set()
+    st.session_state.dl_files = []
 
     t.start()
     st.rerun()
@@ -1385,6 +1446,19 @@ def _drain_queue() -> None:
                 st.session_state.dl_state = "cancelled"
             elif msg["rc"] == 0:
                 st.session_state.dl_state = "done"
+                # Calcula arquivos novos criados pelo download
+                output_dir = Path(st.session_state.dl_output_dir)
+                before = st.session_state.get("dl_files_before") or set()
+                try:
+                    new_files = sorted(
+                        str(p) for p in output_dir.rglob("*")
+                        if p.is_file()
+                        and str(p) not in before
+                        and not any(p.name.endswith(s) for s in (".part", ".ytdl", ".tmp"))
+                    )
+                    st.session_state.dl_files = new_files
+                except OSError:
+                    st.session_state.dl_files = []
             else:
                 st.session_state.dl_state = "error"
                 st.session_state.dl_err = msg.get("err") or f"retcode={msg['rc']}"
@@ -1470,6 +1544,26 @@ def render_download_section() -> None:
             if st.session_state.dl_log:
                 with st.expander("📋 Etapas concluídas", expanded=True):
                     st.markdown("\n\n".join(st.session_state.dl_log))
+            # Botões de download para cada arquivo gerado
+            dl_files = st.session_state.get("dl_files") or []
+            if dl_files:
+                st.markdown("**📥 Baixar arquivo(s):**")
+                for i, fpath_str in enumerate(dl_files):
+                    fpath = Path(fpath_str)
+                    if not fpath.exists():
+                        continue
+                    fsize = fpath.stat().st_size
+                    if fsize > 500 * 1024 * 1024:
+                        st.warning(
+                            f"⚠️ `{fpath.name}` tem {core.format_bytes(fsize)} — "
+                            "o arquivo será carregado na RAM do servidor antes de enviar."
+                        )
+                    st.download_button(
+                        label=f"📥 {fpath.name} ({core.format_bytes(fsize)})",
+                        data=fpath.read_bytes(),
+                        file_name=fpath.name,
+                        key=f"dl_btn_{i}",
+                    )
             # Balloons only on the first render after completion — otherwise any
             # widget interaction (mode change, checkbox) reruns this block and
             # re-fires the animation.
@@ -1487,13 +1581,13 @@ def render_download_section() -> None:
             _is_file_lock = any(k in err_msg for k in
                                 ("WinError 32", "sendo usado",
                                  "being used by another process", "Unable to rename"))
-            if _is_file_lock:
+            if _is_file_lock and sys.platform == "win32":
                 st.warning(
                     "🛡️ **Windows Defender / Indexação** está bloqueando a renomeação do arquivo.\n\n"
                     "Adicione a pasta de downloads às exclusões do Defender:\n"
                     "Segurança do Windows → Proteção contra vírus → Exclusões → Adicionar pasta."
                 )
-            else:
+            elif not _is_file_lock:
                 st.info(
                     "Cheque se o Deno está instalado, se os cookies do Firefox "
                     "estão válidos (refaça o ritual) e se o yt-dlp está atualizado."
@@ -1549,6 +1643,11 @@ def render_download_section() -> None:
 # ================================================================
 
 def main() -> None:
+    if not st.session_state.get("_authenticated"):
+        _render_login()
+        st.stop()
+        return
+
     render_sidebar()
 
     st.title("🎬 YouTube Downloader")
@@ -1558,11 +1657,18 @@ def main() -> None:
     )
 
     if not core.check_deno():
-        st.error(
-            "🚨 **Deno não encontrado.** Sem ele, o YouTube só libera "
-            "thumbnails. Instale pelo PowerShell: "
-            "`winget install DenoLand.Deno` e reabra o terminal."
-        )
+        if sys.platform == "win32":
+            st.error(
+                "🚨 **Deno não encontrado.** Sem ele, o YouTube só libera "
+                "thumbnails. Instale pelo PowerShell: "
+                "`winget install DenoLand.Deno` e reabra o terminal."
+            )
+        else:
+            st.error(
+                "🚨 **Deno não encontrado.** Sem ele, o YouTube só libera thumbnails.\n\n"
+                "Instale: `curl -fsSL https://deno.land/install.sh | sh`\n\n"
+                "Adicione ao PATH e reinicie o container."
+            )
 
     tab1, tab2, tab3 = st.tabs([
         "🔗 Link único",

@@ -1,2 +1,10 @@
 __pycache__/*
 .venv/
+*.pyc
+
+# Secrets — nunca commitar
+.streamlit/secrets.toml
+
+# Pasta de downloads do projeto
+downloads/*
+!downloads/.gitkeep

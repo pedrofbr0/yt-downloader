@@ -1,0 +1,13 @@
+[server]
+headless = true
+port = 8501
+address = "0.0.0.0"
+enableCORS = false
+enableXsrfProtection = true
+# Aumentado para suportar upload de cookies.txt; st.download_button não usa esse limite
+maxUploadSize = 50
+
+[browser]
+# Evita tentativa de abrir browser automaticamente no servidor
+serverAddress = "0.0.0.0"
+gatherUsageStats = false
