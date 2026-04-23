@@ -9,5 +9,4 @@ maxUploadSize = 50
 
 [browser]
 # Evita tentativa de abrir browser automaticamente no servidor
-serverAddress = "0.0.0.0"
 gatherUsageStats = false

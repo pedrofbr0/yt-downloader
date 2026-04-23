@@ -33,6 +33,10 @@ import yt_dlp
 
 import youtube_downloader as core
 
+# True quando rodando dentro de um container Docker (sem navegador instalado)
+_IS_DOCKER = os.path.exists("/.dockerenv")
+_BROWSER_NONE = "Nenhum (usar cookies.txt)"
+
 
 # ================================================================
 # Config básica da página
@@ -57,7 +61,7 @@ def _init_state() -> None:
         "playlist_info": None,
         "output_dir": str(Path.cwd() / "downloads"),
         "output_dir_input": str(Path.cwd() / "downloads"),
-        "browser": "firefox",
+        "browser": _BROWSER_NONE if _IS_DOCKER else "firefox",
         "cookies_upload": None,
         # download state
         "dl_state": "idle",       # "idle"|"running"|"cancelling"|"done"|"error"|"cancelled"
@@ -171,8 +175,8 @@ _RES_LABELS = {2160: "4K (2160p)", 1440: "1440p", 1080: "1080p",
 
 FORMATOS_AUDIO = ["mp3", "m4a", "opus", "wav", "flac", "aac"]
 CONTAINERS     = ["mp4", "mkv", "webm"]
-NAVEGADORES    = ["firefox", "chrome", "edge", "brave", "opera",
-                  "vivaldi", "safari", "chromium"]
+NAVEGADORES    = [_BROWSER_NONE, "firefox", "chrome", "edge", "brave", "opera",
+               "vivaldi", "safari", "chromium"]
 
 AUDIO_QUALITIES = [
     ("Auto (melhor disponível)", "0"),
@@ -188,8 +192,9 @@ AUDIO_QUALITIES = [
 
 def _cookies_config() -> dict:
     """Retorna o dict com cookies_browser e cookies_file do session state."""
-    cfg = {"cookies_browser": st.session_state.get("browser", "firefox"),
-           "cookies_file": None}
+    browser = st.session_state.get("browser", "firefox")
+    cfg = {"cookies_browser": None if browser == _BROWSER_NONE else browser,
+       "cookies_file": None}
     uploaded = st.session_state.get("cookies_upload")
     if uploaded is not None:
         tmp = Path(tempfile.gettempdir()) / "yt_cookies.txt"
@@ -291,10 +296,14 @@ def render_sidebar() -> None:
     ff_ok = env["ffmpeg"]
     fx_ok = env["firefox"]
 
+    firefox_line = (
+        "" if _IS_DOCKER else
+        f"\n- **Firefox:** {'✅ detectado' if fx_ok else '⚠️ não detectado'}"
+    )
     st.sidebar.markdown(
         f"- **Deno:** {'✅ `' + deno_v + '`' if deno_v else '❌ não instalado'}\n"
-        f"- **ffmpeg:** {'✅ OK' if ff_ok else '❌ não instalado'}\n"
-        f"- **Firefox:** {'✅ detectado' if fx_ok else '⚠️ não detectado'}\n"
+        f"- **ffmpeg:** {'✅ OK' if ff_ok else '❌ não instalado'}"
+        f"{firefox_line}\n"
         f"- **yt-dlp:** `{env['ytdlp']}`"
     )
 
@@ -317,11 +326,14 @@ def render_sidebar() -> None:
             st.sidebar.error("Instale ffmpeg: `winget install Gyan.FFmpeg`")
         else:
             st.sidebar.error("Instale ffmpeg: `sudo apt install -y ffmpeg`")
-    if not fx_ok:
-        st.sidebar.warning(
-            "Firefox não detectado. Instale em firefox.com, logue no "
-            "YouTube em aba privada, assista uns segundos de um vídeo e "
-            "**não feche a aba** antes de baixar."
+    if not fx_ok and not _IS_DOCKER:
+        st.sidebar.warning("Firefox não detectado. ...")
+    if _IS_DOCKER:
+        st.sidebar.info(
+            "🍪 **Servidor sem navegador** — use o upload de `cookies.txt` abaixo.\n\n"
+            "Exporte os cookies do seu Firefox local com a extensão "
+            "[cookies.txt](https://addons.mozilla.org/firefox/addon/cookies-txt/) "
+            "enquanto estiver logado no YouTube."
         )
 
     if st.sidebar.button("🔄 Atualizar yt-dlp"):
