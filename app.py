@@ -81,6 +81,7 @@ def _init_state() -> None:
         "dl_files": [],               # paths of new files created by last download
         "dl_files_before": set(),     # snapshot of existing files before download started
         "_authenticated": False,
+        "dl_video_ids": [],       # IDs dos vídeos do download atual
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1439,6 +1440,9 @@ def _start_download(urls: list[str], opts_kwargs: dict,
     except OSError:
         st.session_state.dl_files_before = set()
     st.session_state.dl_files = []
+    st.session_state.dl_video_ids = [
+        i.get("id") for i in (infos or []) if i and i.get("id")
+    ]
 
     t.start()
     st.rerun()
@@ -1478,21 +1482,27 @@ def _drain_queue() -> None:
             elapsed = _fmt_elapsed(time.monotonic() - st.session_state.dl_t0)
             if msg.get("cancelled"):
                 st.session_state.dl_state = "cancelled"
-            elif msg["rc"] == 0:
-                st.session_state.dl_state = "done"
-                # Calcula arquivos novos criados pelo download
-                output_dir = Path(st.session_state.dl_output_dir)
-                before = st.session_state.get("dl_files_before") or set()
-                try:
-                    new_files = sorted(
-                        str(p) for p in output_dir.rglob("*")
-                        if p.is_file()
-                        and str(p) not in before
-                        and not any(p.name.endswith(s) for s in (".part", ".ytdl", ".tmp"))
-                    )
-                    st.session_state.dl_files = new_files
-                except OSError:
-                    st.session_state.dl_files = []
+        elif msg["rc"] == 0:
+            st.session_state.dl_state = "done"
+            output_dir = Path(st.session_state.dl_output_dir)
+            before = st.session_state.get("dl_files_before") or set()
+            video_ids = st.session_state.get("dl_video_ids") or []
+            try:
+                all_output: set[str] = set()
+                for p in output_dir.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    if any(p.name.endswith(s) for s in (".part", ".ytdl", ".tmp")):
+                        continue
+                    # Arquivo novo (não existia antes)
+                    if str(p) not in before:
+                        all_output.add(str(p))
+                    # Ou arquivo que bate com um ID solicitado (yt-dlp pulou por overwrites=False)
+                    elif video_ids and any(f"[{vid_id}]" in p.name for vid_id in video_ids):
+                        all_output.add(str(p))
+                st.session_state.dl_files = sorted(all_output)
+            except OSError:
+                st.session_state.dl_files = []
             else:
                 st.session_state.dl_state = "error"
                 st.session_state.dl_err = msg.get("err") or f"retcode={msg['rc']}"
