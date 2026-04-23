@@ -202,16 +202,27 @@ def _cookies_config() -> dict:
         cfg["cookies_file"] = tmp
     return cfg
 
+def _resolved_browser() -> str | None:
+    """Converte o valor do selectbox para o que o yt-dlp espera."""
+    b = st.session_state.get("browser", "firefox")
+    return None if b == _BROWSER_NONE else b
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _extract_info_cached(url: str, browser: str, process_playlist: bool) -> dict:
-    return core.extract_info(url, cookies_browser=browser,
+def _extract_info_cached(url: str, browser: str | None,
+                         cookies_file: str | None,
+                         process_playlist: bool) -> dict:
+    return core.extract_info(url,
+                             cookies_browser=browser,
+                             cookies_file=Path(cookies_file) if cookies_file else None,
                              process_playlist=process_playlist)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _extract_playlist_flat_cached(url: str, browser: str) -> dict:
-    return core.extract_playlist_flat(url, cookies_browser=browser)
+def _extract_playlist_flat_cached(url: str, browser: str | None,
+                                  cookies_file: str | None) -> dict:
+    return core.extract_playlist_flat(url,
+                                      cookies_browser=browser,
+                                      cookies_file=Path(cookies_file) if cookies_file else None)
 
 
 def _format_spec_for(quality_height: int | None, container: str) -> str:
@@ -1099,9 +1110,11 @@ def tab_single() -> None:
             if url.strip():
                 with st.spinner("Buscando informações (pode levar alguns segundos)..."):
                     try:
+                        cookies = _cookies_config()
                         info = _extract_info_cached(
                             url.strip(),
-                            st.session_state["browser"],
+                            _resolved_browser(),
+                            str(cookies["cookies_file"]) if cookies["cookies_file"] else None,
                             process_playlist=False,
                         )
                         st.session_state.single_info = info
@@ -1151,8 +1164,13 @@ def tab_multi() -> None:
         progress = st.progress(0.0)
         for i, u in enumerate(urls, 1):
             try:
+                cookies = _cookies_config()
                 infos.append(_extract_info_cached(
-                    u, st.session_state["browser"], process_playlist=False))
+                    u,
+                    _resolved_browser(),
+                    str(cookies["cookies_file"]) if cookies["cookies_file"] else None,
+                    process_playlist=False,
+                ))
             except Exception as e:
                 st.warning(f"Falha em `{u}`: {e}")
             progress.progress(i / len(urls))
@@ -1207,8 +1225,12 @@ def tab_playlist() -> None:
             if pl_url.strip():
                 with st.spinner("Buscando playlist..."):
                     try:
+                        cookies = _cookies_config()
                         info = _extract_playlist_flat_cached(
-                            pl_url.strip(), st.session_state["browser"])
+                            pl_url.strip(),
+                            _resolved_browser(),
+                            str(cookies["cookies_file"]) if cookies["cookies_file"] else None,
+                        )
                         st.session_state.playlist_info = info
                     except Exception as e:
                         st.error(f"Não consegui listar: {e}")
