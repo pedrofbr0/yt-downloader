@@ -312,11 +312,16 @@ BASE_OPTS: dict[str, Any] = {
     "remote_components": {"ejs:github"},
 
     # android_vr: fornece DASH completo (vídeo-only + áudio-only) sem DRM
-    # e sem exigir PO Token ou JS challenge.  tv e mweb removidos por
-    # experimentação DRM do YouTube que bloqueia segmentos no meio do download.
+    # e sem exigir PO Token ou JS challenge. tv removido por DRM experimental
+    # no download. mweb adicionado como 3º client só para REFORÇAR extração de
+    # caption_tracks — na versão 2026.04 do yt-dlp, web_safari sozinho tem
+    # devolvido automatic_captions vazio (aparentemente passou a exigir PO
+    # Token para esse endpoint). mweb ainda expõe legendas sem PO Token e não
+    # fornece formats DASH — então android_vr continua sendo o escolhido para
+    # os streams de vídeo/áudio e mweb apenas complementa as legendas.
     "extractor_args": {
         "youtube": {
-            "player_client": ["android_vr", "web_safari"],
+            "player_client": ["android_vr", "web_safari", "mweb"],
         }
     },
     "http_headers": {
@@ -401,6 +406,18 @@ def build_options(
     postprocessors: list[dict] = []
     if subtitles_only:
         opts["skip_download"] = True
+        # Sub-only: prioriza clients que retornam caption_tracks sem PO Token.
+        # android_vr é useless aqui (só expõe formats). Mantemos só 2 clients
+        # para não multiplicar chamadas do extractor por vídeo — cada client
+        # extra = +1 request contra o mesmo IP, acelera o rate-limit 429 do
+        # endpoint de timedtext.
+        opts["extractor_args"] = {
+            **opts.get("extractor_args", {}),
+            "youtube": {"player_client": ["mweb", "web_safari"]},
+        }
+        # Espaça downloads de legenda. Sem isso, uma playlist com 20 vídeos
+        # dispara 20+ requests consecutivos no endpoint timedtext e dá 429.
+        opts["sleep_interval_subtitles"] = 1
     elif audio_only:
         opts["format"] = "bestaudio/best"
         postprocessors.append({
@@ -463,7 +480,6 @@ def build_options(
             # contrário a referência em __files_to_move pode ficar incorreta.
             "key": "FFmpegSubtitlesConvertor",
             "format": "srt",
-            "when": "before_dl",
         })
         # Embutir legendas no container (opt-in pelo usuário).
         # already_have_subtitle=False (default) faz o PP apagar o .srt após
@@ -773,6 +789,13 @@ def download(urls: Iterable[str], opts: dict) -> int:
             notify("⬇️ Baixando legendas…")
         subs_opts = {**BASE_OPTS, "quiet": opts.get("quiet", True)}
         subs_opts["skip_download"] = True
+        # Mesmo racional do build_options: mweb/tv são os clients que
+        # historicamente retornam caption_tracks sem PO Token. Override
+        # explícito para não depender do default de BASE_OPTS.
+        subs_opts["extractor_args"] = {
+            **BASE_OPTS.get("extractor_args", {}),
+            "youtube": {"player_client": ["mweb", "web_safari", "tv", "android_vr"]},
+        }
         subs_opts["writesubtitles"] = True
         subs_opts["writeautomaticsub"] = True
         subs_opts["subtitleslangs"] = separate_subs["langs"]
@@ -782,7 +805,6 @@ def download(urls: Iterable[str], opts: dict) -> int:
         subs_opts["postprocessors"] = [{
             "key": "FFmpegSubtitlesConvertor",
             "format": "srt",
-            "when": "before_dl",
         }]
         for key in ("cookiefile", "cookiesfrombrowser", "playlist_items",
                     "progress_hooks", "postprocessor_hooks", "logger"):

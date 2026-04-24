@@ -602,6 +602,19 @@ class _QueueProgress:
             fn = d.get("filename", "") or ""
             self._put({"type": "log", "msg": f"❌ Erro: `{Path(fn).name if fn else '?'}`"})
 
+    def _close_current_pp(self) -> None:
+        """Emit log + pp_end for whatever PP is currently active."""
+        if not self._current_pp:
+            return
+        elapsed_str = (
+            f" — ⏱ {_fmt_elapsed(time.monotonic() - self._pp_start)}"
+            if self._pp_start else ""
+        )
+        self._put({"type": "log", "msg": f"✅ {self._current_pp} concluído{elapsed_str}"})
+        self._put({"type": "pp_end"})
+        self._current_pp = None
+        self._pp_start = None
+
     def postprocessor_hook(self, d: dict) -> None:
         if self._cancel.is_set():
             raise SystemExit("cancelled")
@@ -611,6 +624,10 @@ class _QueueProgress:
             return
         status = d.get("status")
         if status == "started":
+            # Se o PP anterior não emitiu "finished" (ocorre em algumas versões
+            # do yt-dlp com certos PPs), fecha ele aqui ao chegar o próximo —
+            # caso contrário a UI fica travada no label antigo.
+            self._close_current_pp()
             self._current_pp = label
             self._pp_start = time.monotonic()
             fn = Path(d.get("info_dict", {}).get("filepath", "") or "").name
@@ -621,15 +638,7 @@ class _QueueProgress:
                 "start": self._pp_start,
             })
         elif status == "finished":
-            if self._current_pp:
-                elapsed_str = (
-                    f" — ⏱ {_fmt_elapsed(time.monotonic() - self._pp_start)}"
-                    if self._pp_start else ""
-                )
-                self._put({"type": "log", "msg": f"✅ {self._current_pp} concluído{elapsed_str}"})
-                self._put({"type": "pp_end"})
-                self._current_pp = None
-                self._pp_start = None
+            self._close_current_pp()
 
     def notify(self, msg: str) -> None:
         self._put({"type": "progress", "bar": 0.0, "status": msg})
@@ -784,6 +793,14 @@ def render_download_options(key_prefix: str,
         horizontal=True,
         key=f"{key_prefix}_mode",
     )
+    
+    # Limpa keys de estado dependentes do modo para evitar widgets residuais
+    _prev_mode_key = f"{key_prefix}_prev_mode"
+    if st.session_state.get(_prev_mode_key) != mode:
+        for k in [f"{key_prefix}_subs", f"{key_prefix}_sub_langs",
+                f"{key_prefix}_auto_sub_langs", f"{key_prefix}_embed_subs"]:
+            st.session_state.pop(k, None)
+        st.session_state[_prev_mode_key] = mode
 
     col_a, col_b = st.columns(2)
 
@@ -839,116 +856,87 @@ def render_download_options(key_prefix: str,
                 st.caption("⚡ Qualidade automática — download mais rápido (sem re-encode do áudio).")
 
         # ---- Legendas: picker por idioma ----
-        show_subs_picker = mode in ("Vídeo + áudio", "Apenas vídeo", "Apenas legendas")
-        want_subs: bool = (mode == "Apenas legendas")
+        subs_only_mode = (mode == "Apenas legendas")
+        show_subs_picker = subs_only_mode or mode in ("Vídeo + áudio", "Apenas vídeo")
+        want_subs: bool = subs_only_mode
         if show_subs_picker:
-            st.markdown("**📝 Legendas**")
             manual_subs, auto_subs = _available_subtitles(info)
 
-            if manual_subs or auto_subs:
+            # Em "Apenas legendas" o modo já implica querer legendas — não
+            # renderiza o checkbox "Baixar legendas" (redundante e confunde).
+            # Nos modos de vídeo, o checkbox gate as opções.
+            if not subs_only_mode:
                 want_subs = st.checkbox(
-                    "Baixar legendas",
-                    value=(mode == "Apenas legendas"),
+                    "📝 Baixar legendas",
+                    value=False,
                     key=f"{key_prefix}_subs",
-                    disabled=(mode == "Apenas legendas"),
                 )
-
-                if want_subs or mode == "Apenas legendas":
-                    # Legendas do autor (manuais)
-                    if manual_subs:
-                        all_labels = [s[0] for s in manual_subs]
-                        label_to_lang = {s[0]: s[1] for s in manual_subs}
-
-                        # Default: pt-BR > pt > en (o primeiro encontrado)
-                        default_labels: list[str] = []
-                        for pref in ("pt-BR", "pt", "en"):
-                            match = [lbl for lbl, lang in manual_subs if lang == pref]
-                            if match:
-                                default_labels = match
-                                break
-
-                        selected_labels = st.multiselect(
-                            "Legendas do autor",
-                            all_labels,
-                            default=default_labels,
-                            key=f"{key_prefix}_sub_langs",
-                        )
-                        selected_sub_langs = [label_to_lang[lbl]
-                                              for lbl in selected_labels]
-                    else:
-                        st.caption("Este vídeo não possui legendas feitas pelo autor.")
-
-                    # Legendas automáticas (toggle)
-                    if auto_subs:
-                        show_auto = st.checkbox(
-                            "Incluir legendas geradas automaticamente",
-                            value=(not manual_subs),
-                            key=f"{key_prefix}_show_auto_subs",
-                            help="Legendas geradas por IA — podem conter erros.",
-                        )
-                        if show_auto:
-                            auto_labels = [s[0] for s in auto_subs]
-                            auto_label_to_lang = {s[0]: s[1] for s in auto_subs}
-
-                            # Default auto: pt-BR > pt > en
-                            auto_default: list[str] = []
-                            for pref in ("pt-BR", "pt", "en"):
-                                match = [lbl for lbl, lang in auto_subs
-                                         if lang == pref]
-                                if match:
-                                    auto_default = match
-                                    break
-
-                            selected_auto_labels = st.multiselect(
-                                "Legendas automáticas",
-                                auto_labels,
-                                default=auto_default,
-                                key=f"{key_prefix}_auto_sub_langs",
-                            )
-                            selected_sub_langs += [
-                                auto_label_to_lang[lbl]
-                                for lbl in selected_auto_labels
-                            ]
-
-                    if not selected_sub_langs:
-                        st.warning("Selecione ao menos um idioma de legenda.")
-
-                    if want_subs and mode in ("Vídeo + áudio", "Apenas vídeo"):
-                        embed_subs = st.checkbox(
-                            "Embutir legendas no vídeo",
-                            value=False,
-                            key=f"{key_prefix}_embed_subs",
-                            help=(
-                                "Mais lento — ffmpeg re-multiplexa o vídeo no final. "
-                                "Marcado: a legenda fica embutida e o `.srt` é "
-                                "removido. Desmarcado: o `.srt` é salvo ao "
-                                "lado do vídeo, sem embutir."
-                            ),
-                        )
             else:
-                want_subs = st.checkbox(
-                    "Baixar legendas",
-                    value=(mode == "Apenas legendas"),
-                    key=f"{key_prefix}_subs",
-                    disabled=(mode == "Apenas legendas"),
-                )
-                if want_subs or mode == "Apenas legendas":
-                    st.info("Nenhuma legenda encontrada para este vídeo. "
-                            "Serão buscadas pt, pt-BR e en automaticamente.")
-                    selected_sub_langs = ["pt", "pt-BR", "en"]
+                st.markdown("**📝 Legendas**")
 
-                    if want_subs and mode in ("Vídeo + áudio", "Apenas vídeo"):
-                        embed_subs = st.checkbox(
-                            "Embutir legendas no vídeo",
-                            value=False,
-                            key=f"{key_prefix}_embed_subs",
-                            help=(
-                                "Mais lento — ffmpeg re-multiplexa o vídeo no final. "
-                                "Marcado: a legenda fica embutida e o `.srt` é "
-                                "removido. Desmarcado: o `.srt` é salvo ao "
-                                "lado do vídeo, sem embutir."
-                            ),
-                        )
+            if want_subs:
+                # Prefs de idioma para defaults (acumula pt-BR E en — ambos
+                # são pré-selecionados quando disponíveis).
+                PREF_LANGS = ("pt-BR", "pt", "en")
+
+                def _defaults_for(options: list[tuple[str, str]]) -> list[str]:
+                    out: list[str] = []
+                    for pref in PREF_LANGS:
+                        for lbl, lang in options:
+                            if lang == pref and lbl not in out:
+                                out.append(lbl)
+                    return out
+
+                if manual_subs:
+                    all_labels = [s[0] for s in manual_subs]
+                    label_to_lang = {s[0]: s[1] for s in manual_subs}
+                    selected_labels = st.multiselect(
+                        "Legendas do autor",
+                        all_labels,
+                        default=_defaults_for(manual_subs),
+                        key=f"{key_prefix}_sub_langs",
+                    )
+                    selected_sub_langs = [label_to_lang[lbl]
+                                          for lbl in selected_labels]
+
+                # Legendas automáticas — sempre expostas quando o YouTube
+                # fornece. Sem autor? O multi-select automático assume o papel
+                # principal, com pt-BR e en pré-selecionados por padrão.
+                if auto_subs:
+                    auto_labels = [s[0] for s in auto_subs]
+                    auto_label_to_lang = {s[0]: s[1] for s in auto_subs}
+                    selected_auto_labels = st.multiselect(
+                        "Legendas automáticas (geradas pelo YouTube)",
+                        auto_labels,
+                        default=_defaults_for(auto_subs) if not manual_subs else [],
+                        key=f"{key_prefix}_auto_sub_langs",
+                        help="Legendas geradas por IA — podem conter erros.",
+                    )
+                    selected_sub_langs += [
+                        auto_label_to_lang[lbl]
+                        for lbl in selected_auto_labels
+                    ]
+
+                if not manual_subs and not auto_subs:
+                    # Info sem legendas listadas — tenta pt/pt-BR/en na fé.
+                    st.info("Este vídeo não lista legendas. Serão tentadas "
+                            "automaticamente pt-BR, pt e en no download.")
+                    selected_sub_langs = ["pt-BR", "pt", "en"]
+                elif not selected_sub_langs:
+                    st.warning("Selecione ao menos um idioma de legenda.")
+
+                if mode in ("Vídeo + áudio", "Apenas vídeo"):
+                    embed_subs = st.checkbox(
+                        "Embutir legendas no vídeo",
+                        value=False,
+                        key=f"{key_prefix}_embed_subs",
+                        help=(
+                            "Mais lento — ffmpeg re-multiplexa o vídeo no final. "
+                            "Marcado: a legenda fica embutida e o `.srt` é "
+                            "removido. Desmarcado: o `.srt` é salvo ao "
+                            "lado do vídeo, sem embutir."
+                        ),
+                    )
 
     # ---- Coluna B: cortes & extras ----
     with col_b:
@@ -1480,29 +1468,31 @@ def _drain_queue() -> None:
             st.session_state.dl_log.append(msg["msg"])
         elif msg["type"] == "done":
             elapsed = _fmt_elapsed(time.monotonic() - st.session_state.dl_t0)
+            # Limpa labels de PP ao terminar — evita que a UI desenhe o rótulo
+            # de um postprocessor antigo depois da transição para done/error.
+            st.session_state.dl_pp_label = None
+            st.session_state.dl_pp_start = None
             if msg.get("cancelled"):
                 st.session_state.dl_state = "cancelled"
-        elif msg["rc"] == 0:
-            st.session_state.dl_state = "done"
-            output_dir = Path(st.session_state.dl_output_dir)
-            before = st.session_state.get("dl_files_before") or set()
-            video_ids = st.session_state.get("dl_video_ids") or []
-            try:
-                all_output: set[str] = set()
-                for p in output_dir.rglob("*"):
-                    if not p.is_file():
-                        continue
-                    if any(p.name.endswith(s) for s in (".part", ".ytdl", ".tmp")):
-                        continue
-                    # Arquivo novo (não existia antes)
-                    if str(p) not in before:
-                        all_output.add(str(p))
-                    # Ou arquivo que bate com um ID solicitado (yt-dlp pulou por overwrites=False)
-                    elif video_ids and any(f"[{vid_id}]" in p.name for vid_id in video_ids):
-                        all_output.add(str(p))
-                st.session_state.dl_files = sorted(all_output)
-            except OSError:
-                st.session_state.dl_files = []
+            elif msg["rc"] == 0:
+                st.session_state.dl_state = "done"
+                output_dir = Path(st.session_state.dl_output_dir)
+                before = st.session_state.get("dl_files_before") or set()
+                video_ids = st.session_state.get("dl_video_ids") or []
+                try:
+                    all_output: set[str] = set()
+                    for p in output_dir.rglob("*"):
+                        if not p.is_file():
+                            continue
+                        if any(p.name.endswith(s) for s in (".part", ".ytdl", ".tmp")):
+                            continue
+                        if str(p) not in before:
+                            all_output.add(str(p))
+                        elif video_ids and any(f"[{vid_id}]" in p.name for vid_id in video_ids):
+                            all_output.add(str(p))
+                    st.session_state.dl_files = sorted(all_output)
+                except OSError:
+                    st.session_state.dl_files = []
             else:
                 st.session_state.dl_state = "error"
                 st.session_state.dl_err = msg.get("err") or f"retcode={msg['rc']}"
@@ -1569,6 +1559,46 @@ def render_download_section() -> None:
                 st.session_state.dl_state = "cancelled"
                 st.rerun()
                 return
+            # Worker thread terminou, mas nenhum "done" chegou na fila —
+            # sinal de que alguma exceção propagou fora do try/except do worker
+            # (ou o processo foi morto). Drena uma última vez e transita
+            # para "done"/"error" com base nos arquivos efetivamente gerados.
+            if st.session_state.dl_state == "running" and thread and not thread.is_alive():
+                _drain_queue()
+                if st.session_state.dl_state == "running":
+                    output_dir = Path(st.session_state.dl_output_dir)
+                    before = st.session_state.get("dl_files_before") or set()
+                    video_ids = st.session_state.get("dl_video_ids") or []
+                    new_files: list[str] = []
+                    try:
+                        for p in output_dir.rglob("*"):
+                            if not p.is_file():
+                                continue
+                            if any(p.name.endswith(s) for s in
+                                   (".part", ".ytdl", ".tmp")):
+                                continue
+                            if (str(p) not in before
+                                    or (video_ids
+                                        and any(f"[{v}]" in p.name for v in video_ids))):
+                                new_files.append(str(p))
+                    except OSError:
+                        pass
+                    st.session_state.dl_status = _fmt_elapsed(
+                        time.monotonic() - st.session_state.dl_t0
+                    )
+                    st.session_state.dl_pp_label = None
+                    st.session_state.dl_pp_start = None
+                    if new_files:
+                        st.session_state.dl_state = "done"
+                        st.session_state.dl_files = sorted(new_files)
+                    else:
+                        st.session_state.dl_state = "error"
+                        st.session_state.dl_err = (
+                            "Thread de download finalizou sem sinalizar conclusão "
+                            "e nenhum arquivo novo foi gerado."
+                        )
+                    st.rerun()
+                    return
 
         current_state = st.session_state.dl_state
 
@@ -1675,7 +1705,8 @@ def render_download_section() -> None:
             st.markdown(st.session_state.dl_status)
 
         if st.session_state.dl_log:
-            st.markdown("\n\n".join(st.session_state.dl_log[-12:]))
+            with st.container(height=220):
+                st.markdown("\n\n".join(st.session_state.dl_log))
         st.caption(f"⏱ Tempo decorrido: {elapsed_total}")
 
         time.sleep(0.3)
