@@ -13,6 +13,8 @@ services:
       - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
     expose:
       - "8501"
+    ports:
+      - "127.0.0.1:8501:8501"
     networks:
       - app-net
 
