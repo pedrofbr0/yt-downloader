@@ -33,6 +33,14 @@ import yt_dlp
 
 import youtube_downloader as core
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 # True quando rodando dentro de um container Docker (sem navegador instalado)
 _IS_DOCKER = os.path.exists("/.dockerenv")
 _APP_ENV = os.getenv("APP_ENV", "").strip().lower()
@@ -40,6 +48,12 @@ _IS_PRODUCTION = _IS_DOCKER or _APP_ENV in {"prod", "production"}
 _DEFAULT_OUTPUT_DIR = Path(
     os.getenv("YT_DOWNLOAD_DIR", Path.cwd() / "downloads")
 ).expanduser().resolve()
+_DOWNLOAD_RETENTION_SECONDS = max(
+    60, _env_int("YT_DOWNLOAD_RETENTION_SECONDS", 3 * 60 * 60)
+)
+_DOWNLOAD_CLEANUP_INTERVAL_SECONDS = max(
+    60, _env_int("YT_DOWNLOAD_CLEANUP_INTERVAL_SECONDS", 3 * 60 * 60)
+)
 _BROWSER_NONE = "Nenhum (usar cookies.txt)"
 
 
@@ -85,6 +99,8 @@ def _init_state() -> None:
         "dl_pp_start": None,          # monotonic timestamp when current PP started
         "dl_files": [],               # paths of new files created by last download
         "dl_files_before": set(),     # snapshot of existing files before download started
+        "dl_deleted_files": [],        # files removed after browser download
+        "dl_cleanup_error": None,
         "_authenticated": False,
         "dl_video_ids": [],       # IDs dos vídeos do download atual
     }
@@ -109,6 +125,100 @@ def _force_production_output_dir() -> None:
     fixed_dir = str(_DEFAULT_OUTPUT_DIR)
     st.session_state["output_dir"] = fixed_dir
     st.session_state["output_dir_input"] = fixed_dir
+
+
+def _safe_download_file(path_str: str) -> tuple[Path, Path] | tuple[None, None]:
+    """Resolve a download file only if it is inside the configured output dir."""
+    root = Path(st.session_state.get("output_dir") or _DEFAULT_OUTPUT_DIR)
+    try:
+        root = root.expanduser().resolve()
+        path = Path(path_str).expanduser().resolve()
+        path.relative_to(root)
+    except (OSError, ValueError):
+        return None, None
+    if not path.is_file():
+        return None, None
+    return path, root
+
+
+def _prune_empty_parents(path: Path, root: Path) -> None:
+    parent = path.parent
+    while parent != root and root in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def _delete_downloaded_file(path_str: str) -> None:
+    """Delete the server-side file after Streamlit hands it to the browser."""
+    path, root = _safe_download_file(path_str)
+    if path is None or root is None:
+        return
+    try:
+        path.unlink()
+        _prune_empty_parents(path, root)
+    except OSError as e:
+        st.session_state["dl_cleanup_error"] = f"{path.name}: {e}"
+        return
+
+    st.session_state["dl_files"] = [
+        f for f in (st.session_state.get("dl_files") or [])
+        if Path(f).expanduser().resolve() != path
+    ]
+    deleted = list(st.session_state.get("dl_deleted_files") or [])
+    deleted.append(path.name)
+    st.session_state["dl_deleted_files"] = deleted
+
+
+def _maybe_delete_downloaded_file(path_str: str) -> None:
+    if _IS_PRODUCTION:
+        _delete_downloaded_file(path_str)
+
+
+def _cleanup_old_downloads() -> None:
+    """Remove stale completed files from the production downloads volume."""
+    root = _DEFAULT_OUTPUT_DIR
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    cutoff = time.time() - _DOWNLOAD_RETENTION_SECONDS
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime <= cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+    dirs = sorted(
+        (p for p in root.rglob("*") if p.is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
+    for path in dirs:
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
+@st.cache_resource(show_spinner=False)
+def _start_download_cleanup_thread() -> bool:
+    if not _IS_PRODUCTION:
+        return False
+
+    def _loop() -> None:
+        while True:
+            _cleanup_old_downloads()
+            time.sleep(_DOWNLOAD_CLEANUP_INTERVAL_SECONDS)
+
+    threading.Thread(target=_loop, daemon=True, name="download-cleanup").start()
+    return True
 
 
 def _next_available_suffix(expected_stem: Path, final_ext: str) -> str:
@@ -1454,6 +1564,8 @@ def _start_download(urls: list[str], opts_kwargs: dict,
     except OSError:
         st.session_state.dl_files_before = set()
     st.session_state.dl_files = []
+    st.session_state.dl_deleted_files = []
+    st.session_state.dl_cleanup_error = None
     st.session_state.dl_video_ids = [
         i.get("id") for i in (infos or []) if i and i.get("id")
     ]
@@ -1648,6 +1760,8 @@ def render_download_section() -> None:
             dl_files = st.session_state.get("dl_files") or []
             if dl_files:
                 st.markdown("**📥 Baixar arquivo(s):**")
+                if _IS_PRODUCTION:
+                    st.caption("Depois do clique, o arquivo correspondente sera removido da VM.")
                 for i, fpath_str in enumerate(dl_files):
                     fpath = Path(fpath_str)
                     if not fpath.exists():
@@ -1663,10 +1777,18 @@ def render_download_section() -> None:
                         data=fpath.read_bytes(),
                         file_name=fpath.name,
                         key=f"dl_btn_{i}",
+                        on_click=_maybe_delete_downloaded_file,
+                        args=(fpath_str,),
                     )
-            # Balloons only on the first render after completion — otherwise any
-            # widget interaction (mode change, checkbox) reruns this block and
-            # re-fires the animation.
+            deleted_files = st.session_state.get("dl_deleted_files") or []
+            if _IS_PRODUCTION and deleted_files:
+                st.caption(
+                    "Removido da VM: "
+                    + ", ".join(f"`{name}`" for name in deleted_files[-5:])
+                )
+            if st.session_state.get("dl_cleanup_error"):
+                cleanup_error = st.session_state["dl_cleanup_error"]
+                st.warning(f"Nao consegui remover da VM: `{cleanup_error}`")
             if not st.session_state.dl_balloons_shown:
                 st.balloons()
                 st.session_state.dl_balloons_shown = True
@@ -1744,6 +1866,8 @@ def render_download_section() -> None:
 # ================================================================
 
 def main() -> None:
+    _start_download_cleanup_thread()
+
     if not st.session_state.get("_authenticated"):
         _render_login()
         st.stop()

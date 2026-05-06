@@ -6,6 +6,8 @@ services:
     environment:
       APP_ENV: production
       YT_DOWNLOAD_DIR: /app/downloads
+      YT_DOWNLOAD_RETENTION_SECONDS: 10800
+      YT_DOWNLOAD_CLEANUP_INTERVAL_SECONDS: 10800
     volumes:
       # Pasta de saída persistida no host
       - ./downloads:/app/downloads
