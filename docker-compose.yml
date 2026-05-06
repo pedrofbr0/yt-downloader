@@ -3,6 +3,9 @@ services:
     build: .
     container_name: yt-downloader
     restart: unless-stopped
+    environment:
+      APP_ENV: production
+      YT_DOWNLOAD_DIR: /app/downloads
     volumes:
       # Pasta de saída persistida no host
       - ./downloads:/app/downloads

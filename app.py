@@ -35,6 +35,11 @@ import youtube_downloader as core
 
 # True quando rodando dentro de um container Docker (sem navegador instalado)
 _IS_DOCKER = os.path.exists("/.dockerenv")
+_APP_ENV = os.getenv("APP_ENV", "").strip().lower()
+_IS_PRODUCTION = _IS_DOCKER or _APP_ENV in {"prod", "production"}
+_DEFAULT_OUTPUT_DIR = Path(
+    os.getenv("YT_DOWNLOAD_DIR", Path.cwd() / "downloads")
+).expanduser().resolve()
 _BROWSER_NONE = "Nenhum (usar cookies.txt)"
 
 
@@ -59,8 +64,8 @@ def _init_state() -> None:
         "single_info": None,
         "multi_infos": [],
         "playlist_info": None,
-        "output_dir": str(Path.cwd() / "downloads"),
-        "output_dir_input": str(Path.cwd() / "downloads"),
+        "output_dir": str(_DEFAULT_OUTPUT_DIR),
+        "output_dir_input": str(_DEFAULT_OUTPUT_DIR),
         "browser": _BROWSER_NONE if _IS_DOCKER else "firefox",
         "cookies_upload": None,
         # download state
@@ -86,6 +91,10 @@ def _init_state() -> None:
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    if _IS_PRODUCTION:
+        fixed_dir = str(_DEFAULT_OUTPUT_DIR)
+        st.session_state["output_dir"] = fixed_dir
+        st.session_state["output_dir_input"] = fixed_dir
 
 
 _init_state()
@@ -94,6 +103,13 @@ _init_state()
 # ================================================================
 # Helpers
 # ================================================================
+
+def _force_production_output_dir() -> None:
+    """Mantem producao sempre no volume persistido do projeto."""
+    fixed_dir = str(_DEFAULT_OUTPUT_DIR)
+    st.session_state["output_dir"] = fixed_dir
+    st.session_state["output_dir_input"] = fixed_dir
+
 
 def _next_available_suffix(expected_stem: Path, final_ext: str) -> str:
     """'' se o arquivo final livre; ' (N)' com próximo N livre caso contrário.
@@ -358,22 +374,29 @@ def render_sidebar() -> None:
 
     # ---- Config geral ----
     st.sidebar.subheader("Opções gerais")
-    if sys.platform == "win32":
-        if st.sidebar.button("📂 Escolher pasta"):
-            selected_dir = _ask_directory_popup()
-            if selected_dir:
-                st.session_state["output_dir"] = selected_dir
-                st.session_state["output_dir_input"] = selected_dir
-                st.rerun()
-            else:
-                st.sidebar.info("Nenhuma pasta foi selecionada.")
+    if _IS_PRODUCTION:
+        _force_production_output_dir()
+        st.sidebar.info(
+            "Downloads salvos automaticamente na pasta `downloads/` do projeto."
+        )
+        st.sidebar.caption(f"Caminho interno: `{st.session_state['output_dir']}`")
+    else:
+        if sys.platform == "win32":
+            if st.sidebar.button("📂 Escolher pasta"):
+                selected_dir = _ask_directory_popup()
+                if selected_dir:
+                    st.session_state["output_dir"] = selected_dir
+                    st.session_state["output_dir_input"] = selected_dir
+                    st.rerun()
+                else:
+                    st.sidebar.info("Nenhuma pasta foi selecionada.")
 
-    st.sidebar.text_input(
-        "Pasta de saída",
-        key="output_dir_input",
-        help="Onde os arquivos baixados serão salvos.",
-    )
-    st.session_state["output_dir"] = st.session_state["output_dir_input"]
+        st.sidebar.text_input(
+            "Pasta de saída",
+            key="output_dir_input",
+            help="Onde os arquivos baixados serão salvos.",
+        )
+        st.session_state["output_dir"] = st.session_state["output_dir_input"]
 
     st.session_state["browser"] = st.sidebar.selectbox(
         "Navegador (cookies)",
@@ -1318,6 +1341,9 @@ def _dispatch_download(urls: list[str], opts_kwargs: dict,
             "**Baixar legendas** — antes de iniciar o download."
         )
         return
+
+    if _IS_PRODUCTION:
+        _force_production_output_dir()
 
     output_dir = st.session_state["output_dir"].strip()
     if not output_dir:
